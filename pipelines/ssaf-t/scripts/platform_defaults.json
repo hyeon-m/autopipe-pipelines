@@ -1,0 +1,338 @@
+{
+ "_comment": "Per-platform stage plan and default parameters. run_config.build merges the answers plan.py derives from config.yaml over these.",
+ "cellman_server": "https://cellman.pnucolab.com/kg/v1",
+ "common": {
+  "cluster": {
+   "n_comps": 50,
+   "n_neighbors": 15,
+   "resolution": 1.0
+  },
+  "map": {
+   "method": "lda"
+  },
+  "filter": {
+   "norm_f": 0.3,
+   "min_p": 0.0,
+   "show_unknown": true,
+   "hsm_f": null
+  },
+  "annotate": {
+   "host": "claude",
+   "disease": null,
+   "reference_h5ad": null,
+   "reference_column": null,
+   "reference_scope": "strict",
+   "note": null
+  },
+  "segment": {
+   "enabled": true,
+   "nuclei": "auto",
+   "nuclei_file": null,
+   "nuclei_frame": "image"
+  },
+  "ncores": 16
+ },
+ "platforms": {
+  "xenium": {
+   "regime": "transcript",
+   "dimensions": [
+    2,
+    3
+   ],
+   "default_dimension": 3,
+   "stages": {
+    "2": [
+     "load",
+     "tile",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ],
+    "3": [
+     "load",
+     "zstack",
+     "tile",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ]
+   },
+   "load": {},
+   "zstack": {
+    "source": "morphology.ome.tif",
+    "z_step": null
+   },
+   "tile": {
+    "enabled": false,
+    "tile_size": 10000,
+    "tile_size_unit": "Xenium morphology pixels (0.2125 um)"
+   },
+   "image": {
+    "key": "morphology_focus",
+    "channel": null,
+    "revert_image": false,
+    "intensity": "luminance"
+   },
+   "downsample": {
+    "2": {
+     "n_samples": 10,
+     "block_um": 10,
+     "otsu_mult": null,
+     "bandwidth": 2.5,
+     "sampling_distance": 1.0,
+     "kernel": "gaussian"
+    },
+    "3": {
+     "n_samples": 5,
+     "block_um": 10,
+     "otsu_mult": null,
+     "bandwidth": 2.5,
+     "sampling_distance": 1.0,
+     "kernel": "gaussian"
+    }
+   },
+   "segment": {
+    "nuclei": "nucleus_boundaries"
+   }
+  },
+  "merscope": {
+   "regime": "transcript",
+   "dimensions": [
+    2,
+    3
+   ],
+   "default_dimension": 3,
+   "stages": {
+    "2": [
+     "load",
+     "tile",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ],
+    "3": [
+     "load",
+     "zstack",
+     "tile",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ]
+   },
+   "load": {
+    "z_layers": 3,
+    "z_plane_um": 1.5,
+    "stains": [
+     "DAPI"
+    ]
+   },
+   "zstack": {
+    "source": "images/mosaic_{stain}_z*.tif",
+    "stain": "DAPI",
+    "z_step": 1.5
+   },
+   "tile": {
+    "enabled": false,
+    "tile_size": 20000,
+    "tile_size_unit": "units of the 'global' coordinate system"
+   },
+   "image": {
+    "key": "auto",
+    "channel": null,
+    "revert_image": false,
+    "intensity": "luminance"
+   },
+   "downsample": {
+    "2": {
+     "n_samples": 10,
+     "block_um": 10,
+     "otsu_mult": null,
+     "bandwidth": 2.5,
+     "sampling_distance": 1.0,
+     "kernel": "gaussian"
+    },
+    "3": {
+     "n_samples": 5,
+     "block_um": 10,
+     "otsu_mult": null,
+     "bandwidth": 2.5,
+     "sampling_distance": 1.0,
+     "kernel": "gaussian"
+    }
+   },
+   "segment": {
+    "enabled": false,
+    "nuclei": "file"
+   }
+  },
+  "cosmx": {
+   "regime": "transcript",
+   "experimental": true,
+   "per_fov": true,
+   "dimensions": [
+    2,
+    3
+   ],
+   "default_dimension": 3,
+   "stages": {
+    "2": [
+     "load",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ],
+    "3": [
+     "load",
+     "zstack",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ]
+   },
+   "load": {
+    "dataset_id": null,
+    "fovs": "all",
+    "px_um": 0.12028,
+    "z_plane_um": null
+   },
+   "zstack": {
+    "source": null,
+    "z_step": null
+   },
+   "tile": {
+    "enabled": false
+   },
+   "image": {
+    "key": "composite",
+    "channel": null,
+    "revert_image": false,
+    "intensity": "max"
+   },
+   "downsample": {
+    "2": {
+     "n_samples": 10,
+     "block_um": 10,
+     "otsu_mult": null,
+     "bandwidth": 2.5,
+     "sampling_distance": 1.0,
+     "kernel": "gaussian"
+    },
+    "3": {
+     "n_samples": 5,
+     "block_um": 10,
+     "otsu_mult": null,
+     "bandwidth": 2.5,
+     "sampling_distance": 1.0,
+     "kernel": "gaussian"
+    }
+   },
+   "segment": {
+    "nuclei": "cell_centroids"
+   }
+  },
+  "visiumhd": {
+   "regime": "count",
+   "dimensions": [
+    2
+   ],
+   "default_dimension": 2,
+   "stages": {
+    "2": [
+     "load",
+     "panel_vf",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ]
+   },
+   "load": {
+    "bin_size": 2,
+    "fullres_image_file": "auto"
+   },
+   "panel": {
+    "hvg_n": 5000,
+    "hvg_bin_um": null
+   },
+   "vf": {
+    "bin_um": 2,
+    "bandwidth_um": 2.5,
+    "sampling_distance": 1.0,
+    "kernel": "gaussian"
+   },
+   "downsample": {
+    "2": {
+     "n_samples_per_block": 10,
+     "block_um": 10,
+     "vf_norm_percentile": 25
+    }
+   },
+   "segment": {
+    "enabled": false,
+    "nuclei": "file"
+   }
+  },
+  "stereoseq": {
+   "regime": "count",
+   "dimensions": [
+    2
+   ],
+   "default_dimension": 2,
+   "stages": {
+    "2": [
+     "load",
+     "panel_vf",
+     "downsample",
+     "cluster",
+     "annotate",
+     "map",
+     "filter",
+     "segment"
+    ]
+   },
+   "load": {
+    "dataset_id": null
+   },
+   "panel": {
+    "hvg_n": 5000,
+    "hvg_bin_um": 8.0
+   },
+   "vf": {
+    "bin_um": 0.5,
+    "bandwidth_um": 8.0,
+    "sampling_distance": 1.0,
+    "kernel": "gaussian"
+   },
+   "downsample": {
+    "2": {
+     "n_samples_per_block": 10,
+     "block_um": 10,
+     "vf_norm_percentile": 25
+    }
+   },
+   "segment": {
+    "nuclei": "cells_polygons"
+   }
+  }
+ }
+}

@@ -1,0 +1,195 @@
+{
+  "@context": "https://w3id.org/ro/crate/1.1/context",
+  "@graph": [
+    {
+      "@id": "ro-crate-metadata.json",
+      "@type": "CreativeWork",
+      "about": {
+        "@id": "./"
+      },
+      "conformsTo": {
+        "@id": "https://w3id.org/ro/crate/1.1"
+      }
+    },
+    {
+      "@id": "./",
+      "@type": [
+        "Dataset",
+        "SoftwareSourceCode",
+        "ComputationalWorkflow"
+      ],
+      "creator": [
+        {
+          "@id": "#author"
+        }
+      ],
+      "dateCreated": "2026-10-19",
+      "description": "Segmentation-free spatial cell-type mapping with SSAF-T for Xenium, MERSCOPE, CosMx, Visium HD and Stereo-seq data, from raw output folders or SpatialData .zarr. Transcripts or count bins become a kernel-density vector field; anchors sampled from the tissue are clustered and annotated by CeLLMan, run headless by Claude Code or Codex (optionally in reference mode); every voxel is assigned a cell type, filtered, and optionally cut into cells seeded by nuclei. A changed value re-runs only the stages it affects.",
+      "gpu": "optional",
+      "input": [
+        {
+          "@id": "#input-raw"
+        },
+        {
+          "@id": "#input-zarr"
+        },
+        {
+          "@id": "#input-reference"
+        }
+      ],
+      "inputSetup": "chat",
+      "keywords": [
+        "spatial-transcriptomics",
+        "cell-type",
+        "segmentation-free",
+        "spatialdata",
+        "xenium",
+        "merscope",
+        "cosmx",
+        "visium-hd",
+        "stereo-seq",
+        "annotation",
+        "llm-agent"
+      ],
+      "license": {
+        "@id": "https://spdx.org/licenses/BSD-3-Clause"
+      },
+      "llmCli": [
+        "claude",
+        "codex"
+      ],
+      "name": "ssaf-t",
+      "output": [
+        {
+          "@id": "#output-zarr"
+        },
+        {
+          "@id": "#output-cells"
+        },
+        {
+          "@id": "#output-report"
+        },
+        {
+          "@id": "#output-png"
+        }
+      ],
+      "programmingLanguage": {
+        "@id": "#snakemake"
+      },
+      "sdPublisher": {
+        "@id": "https://hub.autopipe.org"
+      },
+      "softwareRequirements": [
+        {
+          "@id": "#ssaft"
+        },
+        {
+          "@id": "#cellman"
+        },
+        {
+          "@id": "#spatialdata"
+        },
+        {
+          "@id": "#spatialdata-io"
+        },
+        {
+          "@id": "#scanpy"
+        },
+        {
+          "@id": "#rapids-singlecell"
+        }
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "@id": "#author",
+      "@type": "Person",
+      "name": "hyeon-m"
+    },
+    {
+      "@id": "#snakemake",
+      "@type": "ComputerLanguage",
+      "name": "Snakemake",
+      "url": "https://snakemake.readthedocs.io"
+    },
+    {
+      "@id": "#ssaft",
+      "@type": "SoftwareApplication",
+      "name": "SSAF-T",
+      "url": "https://github.com/pnucolab/SSAF-T",
+      "version": "0.1.0"
+    },
+    {
+      "@id": "#cellman",
+      "@type": "SoftwareApplication",
+      "name": "CeLLMan",
+      "url": "https://github.com/pnucolab/CeLLMan"
+    },
+    {
+      "@id": "#spatialdata",
+      "@type": "SoftwareApplication",
+      "name": "spatialdata",
+      "version": "0.7.3"
+    },
+    {
+      "@id": "#spatialdata-io",
+      "@type": "SoftwareApplication",
+      "name": "spatialdata-io",
+      "version": "0.7.0"
+    },
+    {
+      "@id": "#scanpy",
+      "@type": "SoftwareApplication",
+      "name": "scanpy",
+      "version": "1.11.5"
+    },
+    {
+      "@id": "#rapids-singlecell",
+      "@type": "SoftwareApplication",
+      "name": "rapids-singlecell",
+      "version": "0.13.4"
+    },
+    {
+      "@id": "#input-raw",
+      "@type": "FormalParameter",
+      "encodingFormat": "inode/directory",
+      "name": "platform output folder (Xenium, MERSCOPE, CosMx, Visium HD outs, Stereo-seq SAW)"
+    },
+    {
+      "@id": "#input-zarr",
+      "@type": "FormalParameter",
+      "encodingFormat": "application/x-zarr",
+      "name": "SpatialData zarr"
+    },
+    {
+      "@id": "#input-reference",
+      "@type": "FormalParameter",
+      "encodingFormat": "application/x-hdf5",
+      "name": "reference h5ad (optional)"
+    },
+    {
+      "@id": "#output-zarr",
+      "@type": "FormalParameter",
+      "encodingFormat": "application/x-zarr",
+      "name": "SpatialData zarr with cell-type map, RGB map and cells"
+    },
+    {
+      "@id": "#output-cells",
+      "@type": "FormalParameter",
+      "encodingFormat": "application/x-hdf5",
+      "name": "ssaft_cells.h5ad and annotated anchors h5ad"
+    },
+    {
+      "@id": "#output-report",
+      "@type": "FormalParameter",
+      "encodingFormat": "text/markdown",
+      "name": "report.md / summary.json"
+    },
+    {
+      "@id": "#output-png",
+      "@type": "FormalParameter",
+      "encodingFormat": "image/png",
+      "name": "cell-type map preview"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "vendored": [
+    {
+      "commit": "23dd889c0b4e618313bd0d1c078a0a9f7bbec8e4",
+      "copied": "2026-11-15",
+      "include": [
+        "ssaft",
+        "meson.build",
+        "meson.options",
+        "pyproject.toml",
+        "requirements-lock.txt",
+        "README.md",
+        "LICENSE"
+      ],
+      "modified": false,
+      "path": "vendor/SSAF-T",
+      "ref": "23dd889",
+      "source": "https://github.com/pnucolab/SSAF-T"
+    },
+    {
+      "commit": "4495e309c7c735d90075ffd3fe488eea73ebbbe5",
+      "copied": "2026-11-15",
+      "include": [
+        "skills",
+        "agents",
+        "scripts",
+        "mcp",
+        "README.md",
+        "LICENSE",
+        "requirements.txt",
+        "CALLER_PROMPT_GUIDE.md"
+      ],
+      "modified": false,
+      "path": "vendor/CeLLMan",
+      "ref": "4495e309c7c735d90075ffd3fe488eea73ebbbe5",
+      "source": "https://github.com/pnucolab/CeLLMan"
+    }
+  ]
+}

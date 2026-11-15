@@ -1,0 +1,152 @@
+# SSAF-T pipeline configuration. A blank value means the default described on each key (mostly the
+# platform default, scripts/platform_defaults.json).
+# dry_run prints what was detected in the input and the full stage plan with every value used.
+# One sample: set `input`. A batch: list the samples under `samples:` (or give a `manifest:`) at the
+# end; every other key is then the value shared by all samples.
+# Keys marked [detail] are analysis details: chat setup asks about them last, each with its default,
+# after the main settings (SETUP.md section 3, item 10).
+
+# ---------------------------------------------------------------- input and tissue
+# Required for one sample (a batch takes it per sample): dataset under /input (a link made by prepare_input works): a Xenium / MERSCOPE / CosMx output folder, a Visium HD outs folder, a Stereo-seq SAW output (the numbered layout, read with spatialdata_io.stereoseq, or every file in one folder: <chip>.tissue.gem.gz, <chip>_regist.tif, <chip>.cellbin.gef, <chip>.tissue.gef; a GEM table alone is not read), or a SpatialData .zarr (input file)
+input: ""
+# Platform: xenium, merscope, cosmx, visiumhd or stereoseq; blank = the one detected from the folder layout or the zarr element names (dry_run shows it and the candidates; confirm it with the user) (not a file)
+platform: ""
+# The map's dimension: 2 (a 2D cell-type map) or 3 (a 3D map, built on the transcripts' z). Chosen apart from the image downsampling uses (image_key): a 3D map can use a 2D image or a z-stack. Visium HD and Stereo-seq: always 2. Xenium, MERSCOPE, CosMx: blank = 3 (not a file)
+dimension: ""
+# Required: species of the Cell-Ontology module, mouse or human (blank is allowed for an SSAF-T zarr that records it)
+species: ""
+# Required: Cell-Ontology organ module, e.g. kidney, liver, brain, small_intestine (blank is allowed for an SSAF-T zarr that records it)
+organ: ""
+# Tissue condition written into the annotation prompt, e.g. normal or tumor; blank = normal, so set it for a diseased sample
+condition: ""
+# Optional disease context for the annotation (a hint, not a filter), e.g. glioblastoma; blank = none
+disease: ""
+
+# ---------------------------------------------------------------- compute
+cores: 0  # Number of CPU cores for this run; 0 = all cores of the server
+# Compute device: auto (the GPU attached to the run if usable, else CPU), cuda (fail without a GPU) or cpu (not a file)
+gpu: "auto"
+# CPU cores per stage; blank = the cores the run is given (cores above); a number is capped at those (not a file)
+threads: ""
+# [detail] Wait before a memory-heavy stage until the host has room for it (the memory gate); false = never wait
+memory_gate: true
+
+# ---------------------------------------------------------------- platform input
+# Visium HD bin size in µm the run uses: 2, 8 or 16 (Space Ranger's square_002um / 008um / 016um); blank = 2. An SSAF-T count zarr uses the bin size it records
+visiumhd_bin_um: ""
+# Optional: Visium HD full-resolution H&E (.btf / tissue_image.tif) under /input; blank = found in the folder; none = Space Ranger images only (input file)
+visiumhd_fullres_image: ""
+# CosMx µm per image pixel. Blank = from the FOV image size, as the load decides it (CellComposite images of 5472 x 3648 px: 0.18, the earlier camera; 4256 x 4256 px: 0.12028, the newer one); dry_run shows the size and the value, and stops on any other size (then ask the user). A value here overrides the image size. A zarr input (no FOV image file): blank = 0.12028
+cosmx_px_um: ""
+# CosMx FOVs to run, comma-separated ids, for a per-FOV zarr (spatialdata_io.cosmx) only; blank = all. A raw CosMx folder always joins every FOV into one slide
+cosmx_fovs: ""
+# CosMx, a 3D map: µm between the transcripts' z planes (their z is a plane number). Not recorded in the flat files: needed for a 3D map, whichever image is used; blank: dry_run first shows the whole plan, then stops asking for it. Not used for a 2D map
+cosmx_z_plane_um: ""
+# MERSCOPE: every stain in the folder is loaded; this one makes the tissue mask and the z-stack: one of the stains the data has (dry_run lists them, e.g. DAPI, PolyT, Cellbound3); blank = DAPI
+merscope_stain: ""
+# [detail] MERSCOPE: z layer of the mosaic spatialdata_io loads (z_layers), the folder's 2D image; named <data folder>_z<N>. Blank = 3. A layer without a mosaic of merscope_stain stops at dry_run, which lists the layers there are
+merscope_mask_z: ""
+# MERSCOPE, a 3D map: µm between z planes (the transcripts' z is a plane number). Blank = read from the OME headers of the mosaics; when they have no z, dry_run shows the planes by number and stops asking for it (the usual MERSCOPE spacing is 1.5 µm). Not used for a 2D map
+merscope_z_plane_um: ""
+
+# ---------------------------------------------------------------- sampling grid (all platforms)
+# Sampling distance in µm: the grid spacing of the vector field and the cell-type map; any value from the minimum up. Minimum: Visium HD the bin size (visiumhd_bin_um); Stereo-seq the bin size the counts are blurred on (vf_bin_um: the SSAF-T zarr's recorded bin, else the data's, 0.5) but at least 1, i.e. max(bin, 1); Xenium, MERSCOPE, CosMx 1. Blank = the minimum; a smaller value stops the run at dry_run
+sampling_distance: ""
+
+# ---------------------------------------------------------------- the image downsampling uses, z-stack and tiling (transcript platforms)
+# The image downsampling uses: one of the candidates dry_run lists from the data (name, 2D image / z-stack). A 2D image gives one tissue mask (in a 3D map SSAF-T places it at the middle of the transcripts' z range); a z-stack, for a 3D map only, one mask per plane (the planes in z_planes). Raw folders offer the 2D image the reader loads (Xenium morphology_focus, MERSCOPE <data folder>_z3, CosMx composite) and the z-stack (Xenium morphology_zstack from morphology.ome.tif, MERSCOPE <stain>_zstack from the mosaics, or the one zstack_source names); a zarr its image elements. Blank = the recommended one: a 2D map, the 2D image; a 3D map, the z-stack with the most planes, else the 2D image (not a file)
+image_key: ""
+# A z-stack file / glob under /input to offer as a candidate image (Xenium, a zarr; or the name of a zarr's 3D image); blank = Xenium morphology.ome.tif, a zarr's own 3D images. MERSCOPE folders: leave blank (their mosaics are the z-stack) (not a file)
+zstack_source: ""
+# z-stack plane spacing in µm; blank = from the OME metadata (Xenium) or the MERSCOPE z plane spacing (merscope_z_plane_um); Used only when downsampling on a z-stack
+z_step: ""
+# Downsampling on a z-stack (a 3D map with image_key a z-stack; Xenium / MERSCOPE): the planes it is built from, by plane number (Analysis.zstack_image(z=...)): a continuous range (3-8) or a range at a constant step (0-3:3) only. dry_run prints the molecules per plane (Analysis.zstack_planes) and a recommended range. It only decides on which planes' images the anchors are sampled; the cell-type map still covers the whole tissue height the transcripts span. Blank = every plane, allowed only when the z-stack has every plane from 0 (otherwise dry_run shows the table and stops asking for it). A 2D image: blank
+z_planes: ""
+# [detail] Tile the section (Xenium, MERSCOPE); blank = tiled when downsampling on a z-stack, not tiled otherwise (a 3D map on a 2D image is never tiled)
+tile: ""
+# [detail] Tile side in the platform's global units (Xenium morphology pixels, MERSCOPE global); blank = 10000 / 20000
+tile_size: ""
+
+# ---------------------------------------------------------------- tissue mask and anchors
+# [detail] Use one channel of that image for the mask (name or index); blank = all channels (MERSCOPE: merscope_stain decides)
+image_channel: ""
+# [detail] Stain polarity (transcript platforms): false = bright tissue on dark background (DAPI / polyT / morphology), true = dark tissue on bright; blank = false
+revert_image: ""
+# [detail] Tissue-mask threshold as a multiple of the Otsu threshold, e.g. 0.6 for a wider mask, on every platform (the count platforms' tissue image too, and every plane of a z-stack); blank = the Otsu threshold as computed
+otsu_mult: ""
+# [detail] Anchors sampled per 10 µm block of each imaging plane (transcript platforms); blank = 10 for a 2D map, 5 for a 3D map (SSAF-T's defaults)
+n_samples: ""
+# [detail] KDE kernel width in µm; blank = 2.5
+bandwidth: ""
+# [detail] KDE kernel: gaussian, tophat, epanechnikov (about 3x faster, near-identical field), exponential, linear or cosine; blank = gaussian
+kernel: ""
+
+# ---------------------------------------------------------------- vector field (count platforms: Visium HD, Stereo-seq; always 2D)
+# [detail] Anchors per 10 µm block (Visium HD, Stereo-seq; always one layer); blank = 10
+n_samples_per_block: ""
+# [detail] Blur bandwidth in µm; blank = 2.5 (Visium HD) / 8 (Stereo-seq)
+vf_bandwidth_um: ""
+# Blur raster bin in µm; blank = from the data: the Visium HD bin size (visiumhd_bin_um); Stereo-seq: the bin size an SSAF-T zarr records (uns['cellman']['meta']['bin_um']), else 0.5 (a numbered SAW folder: the bin1 table; a SAW folder with every file in one folder: the GEM's own bin, BinSize x 0.5). A SAW folder in one folder has its DNBs summed into bins of this size at load (a multiple of 0.5). dry_run says which. On Stereo-seq it also sets the sampling_distance minimum, max(vf_bin_um, 1)
+vf_bin_um: ""
+# [detail] Blur kernel: gaussian, tophat, epanechnikov, exponential, linear or cosine; blank = gaussian
+vf_kernel: ""
+# [detail] Highly variable genes added to all ontology markers for the gene panel; blank = 5000
+hvg_n: ""
+
+# ---------------------------------------------------------------- clustering, mapping, filtering
+# [detail] Leiden resolution; blank = 1.0
+resolution: ""
+# [detail] Neighbours of the kNN graph; blank = 15
+n_neighbors: ""
+# [detail] Mapping method: lda (keeps rare types), gnb or corr (fastest); blank = lda
+map_method: ""
+# [detail] Density cut as a fraction of each cell type's density peak; blank = 0.3
+norm_f: ""
+# [detail] Keep regions where the annotation abstained (Unknown) on the map: true or false; blank = true
+show_unknown: ""
+
+# ---------------------------------------------------------------- annotation (CeLLMan, run headless)
+# AI CLI that runs CeLLMan: claude (Claude Code) or codex (Codex CLI); it uses the server user's login, which AutoPipe 0.0.36 or later mounts into the container
+annotate_host: "claude"
+# Model for that CLI (a name the CLI accepts, e.g. claude-opus-5-5 or a Codex model). check_env calls the CLI once with it when the run starts and stops, with the reason, if the server user's account cannot use it. Blank = the CLI's default model; the model name actually used is recorded in 00_check/env.json and 05_annotation/summary.json (model_used)
+llm_model: ""
+# [detail] Codex sandbox: danger-full-access or workspace-write; blank = danger-full-access. The container is the sandbox: workspace-write needs Codex's own bubblewrap sandbox, which Docker's default seccomp blocks (bwrap: No permissions to create a new namespace)
+codex_sandbox: ""
+# Optional: reference mode, only when the annotation is to be limited to given cell types (CeLLMan annotate-reference-mode). Either an annotated reference h5ad under /input (with reference_column) ... (input file)
+reference_h5ad: ""
+# ... its label column (needed with reference_h5ad) (not a file)
+reference_column: ""
+# ... or the cell types themselves: a comma-separated list (e.g. "hepatocyte, Kupffer cell"), a YAML list, or a label-list file under /input (.json / .csv / .tsv); blank = no reference (not a file)
+reference_celltypes: ""
+# Reference scope: strict (only the reference's cell types) or refine (their ontology descendants too); blank = strict (not a file)
+reference_scope: ""
+# Independent AI judgments merged into one annotation (CeLLMan consensus): an odd number, 1 = a single judgment; about that many times the annotation quota; not used with a reference; blank = 3
+replicates: ""
+# [detail] Extra note appended to the annotation prompt; blank = none
+annotate_note: ""
+
+# ---------------------------------------------------------------- segmentation
+# Cut the map into cells seeded by nuclei: true or false; blank = on for Xenium, CosMx, Stereo-seq (their nuclei come with the data: Stereo-seq the SAW cell segmentation, 041.cellcut/ or <chip>.cellbin.gef), off for Visium HD, MERSCOPE (no nuclei in the data: give nuclei_file to turn it on)
+segment: ""
+# Nuclei to seed the cells: a shapes or points element of the SpatialData, or file (then nuclei_file); blank = nucleus_boundaries (Xenium) / cell_centroids (CosMx) / cells_polygons (Stereo-seq) (not a file)
+nuclei: ""
+# Optional: nucleus polygons (parquet / geojson / csv with a WKT geometry column) under /input; needed for segmentation on Visium HD and MERSCOPE (input file)
+nuclei_file: ""
+# [detail] Frame of nuclei_file: image (pixels of the platform image) or um; blank = image
+nuclei_frame: ""
+# [detail] 3D map only: majority (one cell per nucleus, of the commonest cell type in its column) or all (one cell per cell type of the column: keeps types a 2D nucleus mask misses, gives more cells than nuclei); blank = majority
+seed_rule: ""
+
+# ---------------------------------------------------------------- batch (several samples, these settings shared)
+# Batch samples, run one after another into runs/<name>/; each item is a path or a mapping of name, input and the keys that differ for it (e.g. nuclei, segment, organ, dimension); empty = one sample (input above)
+samples: []
+# Optional: batch samples as a TSV (columns order, name, path, ..., overrides JSON; extra columns named after config keys); use instead of samples (input file)
+manifest: ""
+# When a sample fails: continue (record it, go on with the next) or stop the batch
+batch_on_fail: "continue"
+# Re-run samples that failed in an earlier run of this batch: true or false (false skips them)
+batch_retry_failed: false
+# Stop every sample before the annotation (after clustering); a later run with false continues them: true or false
+batch_prepare_only: false
+# Stop the batch before the next sample when the output disk has less than this many GB free; 0 = no check
+batch_min_free_gb: 200

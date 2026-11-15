@@ -1,0 +1,52 @@
+# SSAF-T: segmentation-free spatial cell-type mapping (Xenium, MERSCOPE, CosMx, Visium HD, Stereo-seq,
+# or a SpatialData .zarr), stage by stage, with CeLLMan annotation done by Claude Code or Codex
+# headless.
+#
+# One sample (config.yaml `input`): rules/single.smk, results in numbered stage folders.
+# A batch (config.yaml `samples:` or `manifest:`): rules/batch.smk runs every sample one after another
+# with the single-sample workflow in runs/<name>/.
+
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+from snakemake.exceptions import WorkflowError
+
+configfile: "config.yaml"
+
+PIPE = workflow.basedir
+SNAKEFILE = os.path.join(PIPE, "Snakefile")
+PY = os.environ.get("SSAFT_PYTHON", "/opt/conda/envs/ssaft/bin/python")
+
+# No Python bytecode caches in the pipeline folder: neither from this process nor from the scripts it
+# starts (they inherit the environment); caches left there earlier are removed.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+for _cache in glob.glob(f"{PIPE}/**/__pycache__", recursive=True):
+    shutil.rmtree(_cache, ignore_errors=True)
+for _pyc in glob.glob(f"{PIPE}/**/*.pyc", recursive=True):
+    try:
+        os.remove(_pyc)
+    except OSError:
+        pass
+
+sys.path.insert(0, f"{PIPE}/scripts")
+from layout import ANNOTATION_INPUTS, CHECK, DIR_STAGE, FINAL, STAGE_DIR, WORK, annotation_inputs  # noqa: E402
+
+BATCH = not os.environ.get("SSAFT_BATCH_CHILD") and bool(
+    config.get("samples") or str(config.get("manifest") or "").strip())
+
+
+rule all:
+    input:
+        ".batch/batch.done" if BATCH else ["report.md", f"{CHECK}/env.json"],
+
+
+if BATCH:
+    include: "rules/batch.smk"
+else:
+    include: "rules/single.smk"

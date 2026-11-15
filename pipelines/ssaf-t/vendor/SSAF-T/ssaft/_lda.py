@@ -1,0 +1,1437 @@
+"""FICTURE-style pixel-level factor inference.
+
+This is a third mapper, alongside the centroid correlation in
+:func:`ssaft._count.map_corr` and the Gaussian naive Bayes posterior in
+:func:`ssaft._gnb.map_gnb`. Where those score a voxel against a summary of each class,
+this one models the voxel's molecule counts generatively and lets nearby anchors,
+meaning the already-annotated ``downsampled_vectors``, say which celltypes are even
+possible there.
+
+The model is the one of Si and colleagues, 2023, with the single simplification its
+Methods explicitly allow: the factors come from an external annotated reference
+instead of an unsupervised hexagon LDA, and the anchors' factor distributions are
+fixed rather than learned::
+
+    factor k              a CeLLMan celltype, whose gene distribution is beta_k
+    anchor j              a downsampled_vector position, whose theta_j is its
+                          label, one-hot
+    pixel i               a voxel, whose counts come from one factor, not a mixture
+
+    log psi_ik  =  sum_g c_ig * log beta_kg   +   log pi_ik
+                   [ multinomial likelihood ]     [ anchor prior ]
+
+    pi_ik = sum over the anchors j whose label is k of p_ij
+    p_ij  = 1 - (dist(x_i, y_j) / d_max) ** nu
+
+    label(i) = argmax over k of psi_ik
+    score(i) = max over k of psi_ik, which is a posterior and so feeds min_p
+
+Three consequences follow from the model rather than being bolted on.
+
+First, the pixel is not an admixture. The proportion vector theta of LDA lives on the
+anchor, and step 3c of the generative process draws a pixel's counts from a single
+``beta_{z_i}``. A voxel one micrometre across sits inside one cell, so this is both
+faithful and cheap: the likelihood is one matrix multiply rather than a variational
+loop per pixel.
+
+Second, the anchor prior is a hard support constraint. The weight ``p_ij`` is a
+compact-support kernel and is exactly zero at ``d_max``. A celltype with no anchor
+within that radius therefore has a prior of zero, whose logarithm is minus infinity,
+and no likelihood can resurrect it. Measured on mouse kidney Xenium, that leaves a
+median of two to three candidate celltypes out of 27.
+
+Third, pixels with no anchor in range fall back to the likelihood alone. The anchors
+here are a sampled lattice, produced by ``downsample_vector``, rather than the regular
+hexagonal one of the original method, so coverage is uneven and some voxels genuinely
+have no neighbour.
+
+Counts, not normalized vectors
+------------------------------
+A multinomial needs counts, but the pipeline carries vectors that have been
+L1-normalized and then passed through ``log1p``. Both sides are converted back the
+same way::
+
+    counts = expm1(vec) / size_after_normalization * vf_norm * V_eff
+
+Here ``vf_norm`` is a density in molecules per unit volume, and it has been verified
+to preserve mass: summing it over a 500 by 500 micrometre Xenium crop gives 274,042
+against the 276,641 transcripts actually present. Turning a density into a number of
+molecules of evidence needs the kernel's effective volume, and the
+``expression_threshold`` of this package is exactly one transcript's peak density, so
+its reciprocal is that volume::
+
+    V_eff = 1 / expression_threshold = (sqrt(2 * pi) * bandwidth) ** ndim
+
+which is 246 at a bandwidth of 2.5 in three dimensions. Skip it and every voxel
+carries about 0.06 molecules of evidence, far too little to move a posterior off its
+prior. The count backend stores real binned counts, so there the effective volume is
+one.
+
+Anchors inform, they do not decide
+----------------------------------
+An anchor's only channel into the result is the prior, and that prior weights rather
+than gates. Earlier versions multiplied the likelihood by a prior that is exactly zero
+outside ``d_max``, which made the absence of an anchor a veto no expression could
+undo. The absence of an anchor is three different things at once: the celltype is not
+there, the downsampling lattice missed it, or the clustering merged it into a
+neighbour. Measured on mouse kidney Xenium, that veto left a single candidate at 18.8
+percent of nuclei, and 52 percent of the nuclei a reference segmentation calls
+fibroblast had no fibroblast anchor within ``d_max`` at all. The prior is also not the
+more accurate of the two signals: binned by the dictionary's own gap between its first
+and second choice, it is no better than the dictionary in any bin.
+
+The decision is therefore made in three steps. The dictionary proposes, in that every
+class within ``cand_nats`` of the best log-likelihood becomes a candidate. The prior
+ranks what was proposed, by adding ``prior_weight`` times the logarithm of the prior
+after it has been floored, which is what stops it reaching zero. And the annotation's
+``unknown`` classes never win. Even the voxel an anchor sits on is labelled by the
+same argmax as every other voxel, so the likelihood can and does disagree with the
+annotation there. That disagreement is the signal worth seeing.
+"""
+import numpy as np
+
+__all__ = ['build_factors', 'anchor_positions', 'AnchorPrior', 'LDAScorer',
+           'GriddedAnchorPrior',
+           'map_lda']
+
+
+def _pseudo_counts(vec, norm, san, veff, dtype=np.float64):
+    """Convert L1-normalized, log1p transformed vectors back to a molecule-count scale.
+
+    The conversion is the one given in the module docstring.
+
+    The working precision is chosen by the caller. :func:`build_factors` keeps float64
+    because it accumulates hundreds of thousands of anchors into one sum. The mapper
+    passes float32, which is what :class:`LDAScorer` casts to anyway before the matrix
+    multiply, so the extra precision was being computed and then thrown away; on a panel
+    of five thousand genes that doubles both the memory traffic and the cost of ``expm1``.
+
+    The scaling is applied in place and in the original order, so the result is exactly
+    the value the chained expression produced, less three full-size temporaries.
+
+    :param vec: The normalized vectors, of shape ``(n, G)``.
+    :param norm: The per-vector density, of shape ``(n,)``.
+    :param san: The size each vector was normalized to.
+    :param veff: The kernel's effective volume, which is one for the count backend.
+    :param dtype: Working precision.
+    :returns: The counts, of shape ``(n, G)``.
+    :rtype: numpy.ndarray
+    """
+    dt = np.dtype(dtype)
+    out = np.expm1(np.asarray(vec, dtype=dt))
+    out /= dt.type(san)
+    out *= np.asarray(norm, dtype=dt)[:, None]
+    out *= dt.type(veff)
+    return out
+
+
+def _real_class_mask(zg, K):
+    """Mark which classes are real celltypes rather than unknown or background.
+
+    :param zg: The zarr group, read for ``celltype_names``.
+    :param K: Number of classes.
+    :type K: int
+    :returns: A boolean array of length ``K``, true where the class is a real celltype.
+    :rtype: numpy.ndarray
+    """
+    import re
+    names = [str(s) for s in zg['celltype_names'][:]][:K] if 'celltype_names' in zg else []
+    names = names + [f'class{i}' for i in range(len(names), K)]
+    return np.array([not re.fullmatch(r'unknown\d*|background', n.strip(), re.I)
+                     for n in names], dtype=bool)
+
+
+def _core_weights(pos, labels, *, radius=8.0):
+    """Give each anchor the share of its neighbours that carry the same label.
+
+    An anchor is a kernel density sample, not a cell. One sitting where two celltypes meet
+    carries the genes of both, and summing it into its own class is how a neighbour's
+    markers get into a dictionary row. Its neighbourhood says which kind it is: an anchor
+    deep inside a tubule is surrounded by its own label, while one on the interstitial
+    boundary is not. Boundary anchors are therefore down-weighted rather than dropped.
+    Dropping them loses the rare classes entirely, because those live almost only at
+    boundaries.
+
+    :param pos: Anchor positions in micrometres.
+    :param labels: Label of each anchor.
+    :param radius: Neighbourhood radius in micrometres.
+    :type radius: float
+    :returns: One weight per anchor, between zero and one.
+    :rtype: numpy.ndarray
+    """
+    from scipy.spatial import cKDTree
+    pos = np.atleast_2d(np.asarray(pos, dtype=np.float64))
+    lab = np.asarray(labels)
+    r = float(radius)
+    # Counts, not neighbour lists. query_ball_point's default hands back one Python list per
+    # anchor -- 5.9 M lists of ~180 indices on a section this size -- and the per-anchor loop that
+    # reads them is what the stage spends its time on. The same two numbers come from
+    # return_length=True: the whole neighbourhood from one tree, the same-label part from a tree
+    # per label. Same w, no lists.
+    tot = cKDTree(pos).query_ball_point(pos, r=r, workers=-1, return_length=True).astype(np.int64)
+    same = np.ones(len(lab), dtype=np.int64)
+    for k in np.unique(lab):
+        idx = np.flatnonzero(lab == k)
+        if idx.size == 0:
+            continue
+        sub = pos[idx]
+        same[idx] = cKDTree(sub).query_ball_point(sub, r=r, workers=-1, return_length=True)
+    w = np.ones(len(lab), dtype=np.float64)
+    m = tot > 1
+    w[m] = (same[m] - 1) / (tot[m] - 1)
+    return w
+
+
+def _owned_gene_sets(lam, real, frac):
+    """Find, per class, the positions of the genes that class's own data owns.
+
+    The marker-aware rule needs to know which genes speak for a celltype. Taking that from
+    the annotation's YAML file leaves the eight of eighteen mouse kidney classes that
+    carry no marker there with no owned gene at all, so every one of their genes is
+    replaced by the tissue background and the row stops discriminating. The anchors
+    already answer the question: a gene belongs to each class whose rate for it reaches
+    ``frac`` times the highest rate any real class shows for that gene.
+
+    :param lam: The raw per-class pseudobulk, of shape ``(K, G)``.
+    :param real: Boolean mask of the classes that are real celltypes.
+    :param frac: Fraction of the highest real-class rate at which ownership begins.
+    :type frac: float
+    :returns: One entry per class, each either an array of gene positions or ``None``.
+    :rtype: list
+    """
+    K = lam.shape[0]
+    p = lam / np.maximum(lam.sum(1, keepdims=True), 1e-12)
+    if not np.asarray(real).any():
+        return [None] * K
+    own = (p >= float(frac) * p[real].max(0)[None, :]) & np.asarray(real)[:, None] & (p > 0)
+    return [np.nonzero(own[k])[0] if (real[k] and own[k].any()) else None for k in range(K)]
+
+
+def build_factors(zg, *, gene_indices=None, size_after_normalization=10.0,
+                  veff=1.0, log_transformed=True, sampling_distance=1.0,
+                  purity_radius=8.0, min_effective=300.0, own_frac=0.5,
+                  verbose=False):
+    """Build each celltype's gene distribution from the annotation.
+
+    The distribution is built by summing the annotated ``normalized_vectors`` per class in
+    ``cluster_labels``, which encodes ``obs['cellman_annotation']``, after converting them
+    back to counts, and then normalizing each row. This is the external reference used
+    directly as input factors, with two corrections the anchors themselves pay for.
+
+    The first is core weighting, performed by :func:`_core_weights`. An anchor counts for
+    its class in proportion to how much of its own neighbourhood, within
+    ``purity_radius``, carries the same label. A class whose total weight falls below
+    ``min_effective`` is softened to the average of its weight and one instead, so that a
+    rare celltype which only ever appears at boundaries keeps its evidence.
+
+    The second is data-driven ownership, performed by :func:`_owned_gene_sets`. Which
+    genes a class owns is read off the anchors rather than off the marker YAML file, and
+    is then handed to :func:`_marker_aware_beta` exactly as before.
+
+    That rule says two things. A gene that is the celltype's own marker, or is nobody's
+    marker, keeps the celltype's measured rate. A gene that is another celltype's marker,
+    or was never detected in this celltype, is set to the gene's tissue-wide background
+    rate.
+
+    The second case is the point. A kernel density voxel mixes neighbouring cells, so a
+    podocyte anchor carries some of the glomerular endothelium's ``Ehd3``. Left in, that
+    borrowed signal lets the podocyte compete on a marker it does not own; measured,
+    ``Ehd3`` stood at 3.11 percent in podocyte against 3.61 percent in glomerular
+    endothelial cell, so the real marker contributed almost nothing to the decision.
+    Zeroing it instead would make the entry a veto whose strength is set by the smoothing
+    constant rather than by the data. The background rate says the honest thing, which is
+    that this celltype's data tells us nothing about this gene, so the tissue average
+    should be assumed.
+
+    :param zg: The zarr group holding ``normalized_vectors``, ``downsampled_vf_norm``,
+        ``downsampled_vectors`` and ``cluster_labels``.
+    :param gene_indices: An optional column subset, in the order the field carries them.
+    :param size_after_normalization: The size each vector was normalized to.
+    :param veff: The kernel's effective volume, as described in the module docstring. It
+        is one for the count backend and the reciprocal of the expression threshold for
+        the transcript backend. Only the relative scale matters here, because the rows are
+        normalized, so this argument exists for symmetry.
+    :param log_transformed: Whether ``normalized_vectors`` had ``log1p`` applied.
+    :type log_transformed: bool
+    :param sampling_distance: Micrometres per voxel index, used to put the anchors into
+        micrometres for the neighbourhood radius.
+    :param purity_radius: Neighbourhood radius in micrometres for the core weight.
+    :param min_effective: Total weight below which a class is softened rather than
+        core-weighted.
+    :param own_frac: A gene belongs to every real class whose rate reaches this fraction
+        of the highest real-class rate for that gene.
+    :param verbose: Whether to print a summary.
+    :type verbose: bool
+    :returns: A pair holding the row-normalized distributions, of shape ``(K, G)``, and
+        the class identifiers.
+    :rtype: tuple
+    :raises ValueError: If the store lacks ``normalized_vectors`` or ``cluster_labels``.
+    """
+    if 'normalized_vectors' not in zg or 'cluster_labels' not in zg:
+        raise ValueError('LDA factors need normalized_vectors + cluster_labels; '
+                         'pass h5ad=<annotated .h5ad> to map_celltypes first')
+    y = np.asarray(zg['cluster_labels'][:])
+    n_anchor = int(zg['normalized_vectors'].shape[0])
+    if 'downsampled_vf_norm' in zg:
+        vn = np.asarray(zg['downsampled_vf_norm'][:], dtype=np.float64).ravel()
+    else:                       # no per-anchor density: treat every vector equally
+        vn = np.ones(n_anchor, dtype=np.float64)
+    K = int(zg['centroids'].shape[0]) if 'centroids' in zg else int(y.max()) + 1
+    gi = None if gene_indices is None else np.asarray(gene_indices, dtype=np.int64)
+    n_gene = int(zg['normalized_vectors'].shape[1]) if gi is None else int(gi.size)
+    pos, _ = anchor_positions(zg, sampling_distance=sampling_distance)
+    w = _core_weights(pos, y, radius=purity_radius)
+    # soften the classes that are too thin to be core-weighted BEFORE the pass over the
+    # anchors, so each anchor's weight is final and the sums can be accumulated blockwise
+    n_soft = 0
+    for k in range(K):
+        m = y == k
+        if not m.any():
+            continue
+        if w[m].sum() < float(min_effective):
+            w[m] = 0.5 * (w[m] + 1.0)
+            n_soft += 1
+    # blockwise: materializing every anchor's counts at once is 274 GB on a 5k-gene panel
+    # with 7.4 M anchors (float64), and the watchdog killed the stage there. One block of
+    # rows at a time costs `block` x n_gene x 8 B and sums into the same float64 lam.
+    lam = np.zeros((K, n_gene), dtype=np.float64)
+    block = max(1, int(2 << 30) // max(1, n_gene * 8))       # ~2 GiB of working rows
+    for s0 in range(0, n_anchor, block):
+        s1 = min(s0 + block, n_anchor)
+        V = np.asarray(zg['normalized_vectors'][s0:s1], dtype=np.float64)
+        if not log_transformed:
+            V = np.log1p(V)
+        cnt = _pseudo_counts(V, vn[s0:s1], size_after_normalization, veff)
+        del V
+        if gi is not None:
+            cnt = cnt[:, gi]
+        yb, wb = y[s0:s1], w[s0:s1]
+        for k in np.unique(yb):
+            if k < 0 or k >= K:
+                continue
+            m = yb == k
+            lam[k] += (cnt[m] * wb[m][:, None]).sum(0)
+        del cnt
+    real = _real_class_mask(zg, K)
+    sets = _owned_gene_sets(lam, real, own_frac)
+    beta = _marker_aware_beta(lam, sets)
+    if verbose:
+        n_lab = int((y >= 0).sum())
+        n_own = sum(0 if s is None else len(s) for s in sets)
+        print(f'[lda] factors {beta.shape} from {n_lab:,} annotated vectors, {K} celltypes '
+              f'({int(real.sum())} real); core-weighted r={purity_radius:g} µm '
+              f'(median w={np.median(w):.2f}, {n_soft} classes softened), '
+              f'{n_own:,} owned gene slots at own_frac={own_frac:g}')
+    return beta, np.arange(K)
+
+
+def _marker_aware_beta(lam, marker_sets):
+    """Replace the entries a celltype's own data cannot speak to with the background.
+
+    ``lam`` is the raw per-celltype pseudobulk. Two kinds of entry carry no information
+    about the celltype. One is a gene that belongs to a different celltype's marker set,
+    where whatever is present came from a neighbouring cell through the kernel. The other
+    is a gene never detected in this celltype at all. Both are replaced by the gene's
+    tissue-wide rate, which is what an absence of information should look like.
+
+    :param lam: The raw per-celltype pseudobulk, of shape ``(K, G)``.
+    :param marker_sets: One entry per celltype, each either an array of owned gene
+        positions or ``None``.
+    :returns: The row-normalized distributions, of shape ``(K, G)``.
+    :rtype: numpy.ndarray
+    """
+    lam = np.asarray(lam, dtype=np.float64)
+    K, G = lam.shape
+    own = np.zeros((K, G), dtype=bool)
+    for k, idx in enumerate(marker_sets or []):
+        if k >= K or idx is None:
+            continue
+        idx = np.asarray(idx, dtype=np.int64)
+        if idx.size:
+            own[k, idx] = True
+    any_marker = own.any(0)
+    total = lam.sum()
+    if total <= 0:
+        return np.full((K, G), 1.0 / max(G, 1))
+    p = lam / np.maximum(lam.sum(1, keepdims=True), 1e-12)
+    bg = lam.sum(0) / total
+    uninformative = (any_marker[None, :] & ~own) | (lam <= 0)
+    l = np.where(uninformative, bg[None, :], p)
+    return l / np.maximum(l.sum(1, keepdims=True), 1e-12)
+
+
+def anchor_positions(zg, *, sampling_distance=1.0, coordinate_offset=None):
+    """Return the positions and labels of the annotated downsampled vectors.
+
+    ``downsampled_vectors`` holds voxel indices relative to the grid that produced them,
+    so they become absolute micrometres through the same offset that grid used. When the
+    store is later re-gridded, for instance to map a crop, that offset no longer matches
+    and the caller must pass ``coordinate_offset`` explicitly. The mismatch is otherwise
+    silent, and an anchor set displaced by even a few hundred micrometres makes every
+    prior uniform, which looks exactly like the anchors having done nothing.
+
+    The z column is returned even when every anchor shares one plane, which is what
+    ``downsample_vector`` writes today for a field it treated as planar. The prior then
+    computes the same distances it always did, because a constant column cancels, so a
+    store written before anchors carried depth maps exactly as it did before. A store
+    whose anchors do span depth gets a prior that can tell two celltypes stacked in depth
+    apart.
+
+    :param zg: The zarr group holding ``downsampled_vectors``, ``coordinate_offset`` and
+        ``cluster_labels``.
+    :param sampling_distance: Micrometres per voxel index.
+    :param coordinate_offset: An explicit offset in micrometres, overriding the one stored.
+    :returns: A pair holding the positions, of shape ``(n, 3)`` in micrometres, and the
+        labels, of shape ``(n,)``.
+    :rtype: tuple
+    """
+    dv = np.asarray(zg['downsampled_vectors'][:])
+    if dv.shape[0] not in (2, 3):
+        dv = dv.T
+    off = (np.asarray(zg['coordinate_offset'][:], dtype=np.float64)
+           if coordinate_offset is None else np.asarray(coordinate_offset, np.float64))
+    z = (dv[2] * sampling_distance + off[2] if dv.shape[0] > 2
+         else np.zeros(dv.shape[1], dtype=np.float64))
+    xyz = np.stack([dv[0] * sampling_distance + off[0],
+                    dv[1] * sampling_distance + off[1],
+                    np.asarray(z, dtype=np.float64)], 1).astype(np.float64)
+    return xyz, np.asarray(zg['cluster_labels'][:])
+
+
+class _LatticeKNNPrior:
+    """The nearest-neighbour prior of :class:`AnchorPrior`, computed on the GPU.
+
+    Anchors and voxels share one lattice, because ``downsampled_vectors`` are voxel
+    indices. The nearest ``k_max`` anchors within ``d_max`` are therefore the anchors met
+    first when the lattice offsets inside the ball of radius ``d_max`` are walked in
+    increasing distance.
+
+    The anchor voxels are kept as a sorted list of keys with a per-voxel class histogram,
+    since several anchors may share a voxel. Each batch of queries looks every candidate
+    offset up with a binary search, caps the running anchor count at ``k_max`` in order of
+    distance, and adds the weighted histograms. Offsets whose depth holds no anchor plane
+    are skipped for each query depth.
+
+    Memory is bounded per batch at roughly 40 bytes per pair of query and offset, with the
+    batch sized to a quarter of the device's free memory, capped at ``max_bytes``, and
+    halved whenever the device runs out of memory. Ties at the ``k_max``-th distance are
+    broken by the order of the offsets.
+    """
+
+    def __init__(self, pos, labels, n_classes, *, d_max, nu, k_max, sampling_distance,
+                 device, mem_frac=0.25, max_bytes=4 << 30):
+        """Place the anchors on the lattice and precompute the offset shells.
+
+        :param pos: Anchor positions in micrometres. A planar array is padded with zero depth.
+        :param labels: Label of each anchor.
+        :param n_classes: Number of classes.
+        :type n_classes: int
+        :param d_max: Radius beyond which an anchor has no influence, in micrometres.
+        :param nu: Exponent of the compact-support kernel.
+        :param k_max: Largest number of anchors that may contribute to one query.
+        :type k_max: int
+        :param sampling_distance: Lattice spacing in micrometres.
+        :param device: The torch device to hold the anchor tables on.
+        :param mem_frac: Fraction of the device's free memory one batch may use.
+        :param max_bytes: Hard cap on the memory one batch may use.
+        :raises ValueError: If the anchors do not sit on a lattice of the given spacing.
+        """
+        import torch
+        pos = np.atleast_2d(np.asarray(pos, dtype=np.float64))
+        if pos.shape[1] == 2:
+            pos = np.column_stack([pos, np.zeros(len(pos))])
+        lab = np.asarray(labels).astype(np.int64)
+        self.K, self.d_max, self.nu, self.k_max = int(n_classes), float(d_max), float(nu), int(k_max)
+        self.sd, self.dev = float(sampling_distance), torch.device(device)
+        self.mem_frac, self.max_bytes = float(mem_frac), int(max_bytes)
+        self.r = r = int(np.ceil(self.d_max / self.sd))
+        self.o = pos.min(0)
+        idx = np.rint((pos - self.o) / self.sd).astype(np.int64)
+        if len(pos) == 0 or np.abs(idx * self.sd + self.o - pos).max() > 1e-3 * self.sd:
+            raise ValueError('anchors are not on a lattice of the sampling distance')
+        # 2r of padding: a query kept for lookup (index in [r, N - r)) never wraps a row
+        self.lo = idx.min(0) - 2 * r
+        idx -= self.lo
+        self.N = idx.max(0) + 2 * r + 1
+        NY, NZ = int(self.N[1]), int(self.N[2])
+        key = (idx[:, 0] * NY + idx[:, 1]) * NZ + idx[:, 2]
+        u, inv = np.unique(key, return_inverse=True)
+        H = np.zeros((len(u), self.K), dtype=np.float32)
+        np.add.at(H, (inv, lab), 1.0)
+        self.u = torch.as_tensor(u, device=self.dev)
+        self.H = torch.as_tensor(H, device=self.dev)
+        self.C = self.H.sum(1)
+        self.zplanes = np.unique(idx[:, 2])
+        g = np.arange(-r, r + 1)
+        dx, dy, dz = (a.ravel() for a in np.meshgrid(g, g, g, indexing='ij'))
+        d = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2) * self.sd
+        keep = d < self.d_max                       # the KD-tree's own test: dist < d_max
+        dx, dy, dz, d = dx[keep], dy[keep], dz[keep], d[keep]
+        order = np.lexsort((dx, dy, dz, d))         # increasing distance
+        self.dx, self.dy, self.dz = dx[order], dy[order], dz[order]
+        self.w = (1.0 - (np.minimum(d[order], self.d_max) / self.d_max) ** self.nu
+                  ).astype(np.float32)
+        self._zcache = {}
+        self.last_empty = 0
+
+    def _offsets(self, iz):
+        """Return the offset shell for one query depth, caching it per depth.
+
+        Offsets whose depth lands on a plane holding no anchor are dropped, because they can
+        contribute nothing.
+
+        :param iz: The query's lattice index along z.
+        :type iz: int
+        :returns: A pair of tensors holding the linear offsets and their kernel weights.
+        :rtype: tuple of torch.Tensor
+        """
+        import torch
+        if iz not in self._zcache:
+            NY, NZ = int(self.N[1]), int(self.N[2])
+            m = np.isin(iz + self.dz, self.zplanes)
+            lin = (self.dx[m] * NY + self.dy[m]) * NZ + self.dz[m]
+            self._zcache[iz] = (torch.as_tensor(lin, device=self.dev),
+                                torch.as_tensor(self.w[m], device=self.dev))
+        return self._zcache[iz]
+
+    def _batch(self, n_off):
+        """Choose how many queries to process at once, from the device's free memory.
+
+        :param n_off: Number of offsets in the shell being walked.
+        :type n_off: int
+        :returns: The batch size, never below 256.
+        :rtype: int
+        """
+        import torch
+        free, _ = torch.cuda.mem_get_info(self.dev)
+        budget = min(free * self.mem_frac, self.max_bytes)
+        return int(max(256, budget // (max(n_off, 1) * 40)))
+
+    def _accumulate(self, out, rows_t, key_t, off, w):
+        """Add one batch of queries' weighted class histograms into the output.
+
+        Each candidate offset is looked up by binary search, the running count of anchors is
+        capped at ``k_max`` in order of distance, and the surviving fraction of each voxel's
+        histogram is scattered into the output rows.
+
+        :param out: The output, of shape ``(n, K)``, accumulated into in place.
+        :param rows_t: Output row index of each query in this batch.
+        :param key_t: Lattice key of each query in this batch.
+        :param off: Linear offsets of the shell, in increasing distance.
+        :param w: Kernel weight of each offset.
+        """
+        import torch
+        cand = key_t[:, None] + off[None, :]
+        j = torch.searchsorted(self.u, cand).clamp_max_(self.u.numel() - 1)
+        c = torch.where(self.u[j] == cand, self.C[j], torch.zeros((), device=self.dev))
+        del cand
+        before = c.cumsum(1) - c
+        take = torch.minimum((self.k_max - before).clamp_min_(0), c)
+        del before
+        bi, oi = torch.nonzero(take > 0, as_tuple=True)
+        jj = j[bi, oi]
+        coef = w[oi] * take[bi, oi] / self.C[jj]
+        out.index_add_(0, rows_t[bi], coef[:, None] * self.H[jj])
+
+    def __call__(self, q):
+        """Return the row-normalized prior for a set of queries, on the device.
+
+        :param q: Query positions in micrometres. A planar array is padded with zero depth.
+        :returns: The prior, of shape ``(n, K)``, where a row with no anchor in range is
+            uniform.
+        :rtype: torch.Tensor
+        :raises ValueError: If the queries do not sit on the anchors' lattice.
+        """
+        import torch
+        q = np.atleast_2d(np.asarray(q, dtype=np.float64))
+        if q.shape[1] == 2:
+            q = np.column_stack([q, np.zeros(len(q))])
+        iq = np.rint((q - self.o) / self.sd).astype(np.int64)
+        if len(q) and np.abs(iq * self.sd + self.o - q).max() > 1e-3 * self.sd:
+            raise ValueError("queries are not on the anchors' lattice")
+        iq -= self.lo
+        NY, NZ = int(self.N[1]), int(self.N[2])
+        out = torch.zeros((len(q), self.K), dtype=torch.float32, device=self.dev)
+        # a query farther than r lattice steps outside the anchors' box has no anchor in range
+        inside = np.all((iq >= self.r) & (iq < self.N - self.r), axis=1)
+        key = (iq[:, 0] * NY + iq[:, 1]) * NZ + iq[:, 2]
+        for iz in np.unique(iq[inside, 2]):
+            sel = np.flatnonzero(inside & (iq[:, 2] == iz))
+            off, w = self._offsets(int(iz))
+            if off.numel() == 0:
+                continue
+            B, s = self._batch(off.numel()), 0
+            while s < len(sel):
+                rows = sel[s:s + B]
+                try:
+                    self._accumulate(out, torch.as_tensor(rows, device=self.dev),
+                                     torch.as_tensor(key[rows], device=self.dev), off, w)
+                    s += len(rows)
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    if B <= 256:
+                        raise
+                    B //= 2
+        tot = out.sum(1, keepdim=True)
+        empty = tot[:, 0] <= 0
+        self.last_empty = int(empty.sum())
+        out = out / tot.clamp_min(1e-30)
+        out[empty] = 1.0 / self.K                   # no anchor in range -> uniform
+        return out
+
+
+class AnchorPrior:
+    """A compact-support kernel over nearby anchors, giving a per-pixel factor prior.
+
+    The weight is ``p_ij = 1 - (d_ij / d_max) ** nu`` for anchors inside ``d_max``, and
+    exactly zero outside it. The radius is chosen larger than the anchor spacing and
+    smaller than a cell diameter, so that the prior refines boundaries without smoothing
+    across cells.
+    """
+
+    def __init__(self, xy, labels, n_classes, *, d_max=12.0, nu=2.0, k_max=48,
+                 sampling_distance=None):
+        """Build the anchor index, dropping the anchors that carry no celltype.
+
+        Background anchors carry a label of minus one and are removed here, so they add to no
+        class's prior. That matches :class:`GriddedAnchorPrior`, which counts anchors per
+        class and therefore never sees them.
+
+        A depth column that never varies is kept rather than dropped, because the tree
+        distance is unchanged by a constant coordinate, so single-plane anchors behave exactly
+        as they did in two dimensions.
+
+        :param xy: Anchor positions in micrometres.
+        :param labels: Label of each anchor, where minus one means background.
+        :param n_classes: Number of classes.
+        :type n_classes: int
+        :param d_max: Radius beyond which an anchor has no influence, in micrometres.
+        :param nu: Exponent of the compact-support kernel.
+        :param k_max: Largest number of anchors that may contribute to one query.
+        :type k_max: int
+        :param sampling_distance: Lattice spacing in micrometres. Supplying it allows
+            :meth:`torch_lookup` to answer on the GPU through :class:`_LatticeKNNPrior`.
+            Leaving it at ``None`` keeps the tree for every lookup.
+        """
+        from scipy.spatial import cKDTree
+        pos = np.atleast_2d(np.asarray(xy, dtype=np.float64))
+        labels = np.asarray(labels)
+        # Background anchors carry label -1 (no cell type): they add to no class's prior, as in
+        # GriddedAnchorPrior, which counts lab == k per class and so never sees them.
+        keep = labels >= 0
+        pos, labels = pos[keep], labels[keep]
+        self.ndim = int(pos.shape[1])
+        # A z column that never varies is kept: the KD-tree distance is unchanged by a
+        # constant coordinate, so single-plane anchors behave exactly as they did in 2D.
+        self.zfill = float(np.median(pos[:, 2])) if self.ndim > 2 else 0.0
+        self.tree = cKDTree(pos)
+        self.labels = np.asarray(labels)
+        self.K = int(n_classes)
+        self.d_max = float(d_max)
+        self.nu = float(nu)
+        self.k_max = int(k_max)
+        # Anchors on a voxel lattice of this spacing let torch_lookup answer on the GPU
+        # (:class:`_LatticeKNNPrior`); None keeps the KD-tree for every lookup.
+        self.sampling_distance = None if sampling_distance is None else float(sampling_distance)
+        self._pos = pos
+        self._gpu = None
+        self._gpu_off = False
+
+    def _query_points(self, pix):
+        """Put queries into the anchors' own dimensionality.
+
+        A query with too few columns is padded with the anchors' median depth, and one with
+        too many is truncated.
+
+        :param pix: The query positions.
+        :returns: The queries, with exactly as many columns as the anchors have.
+        :rtype: numpy.ndarray
+        """
+        q = np.atleast_2d(np.asarray(pix, dtype=np.float64))
+        if q.shape[1] == self.ndim:
+            return q
+        if q.shape[1] < self.ndim:
+            return np.column_stack([q, np.full((len(q), self.ndim - q.shape[1]),
+                                               self.zfill)])
+        return np.ascontiguousarray(q[:, :self.ndim])
+
+    def to_torch(self, device):
+        """Build the GPU lookup now, if the anchors allow it.
+
+        See :meth:`torch_lookup` for when that is possible.
+
+        :param device: The torch device to build on.
+        :returns: This prior.
+        :rtype: AnchorPrior
+        """
+        self._lattice(device)
+        return self
+
+    def _lattice(self, device):
+        """Return the GPU lookup for a device, or ``None`` when the tree must answer.
+
+        The lookup is built once and reused, and is disabled permanently if the anchors turn
+        out not to sit on the lattice.
+
+        :param device: The torch device wanted.
+        :returns: The lattice lookup, or ``None``.
+        :rtype: _LatticeKNNPrior or None
+        """
+        import torch
+        dev = torch.device(device)
+        if self._gpu_off or self.sampling_distance is None or dev.type != 'cuda':
+            return None
+        if self._gpu is None or self._gpu.dev != dev:
+            try:
+                self._gpu = _LatticeKNNPrior(
+                    self._pos, self.labels, self.K, d_max=self.d_max, nu=self.nu,
+                    k_max=self.k_max, sampling_distance=self.sampling_distance, device=dev)
+            except ValueError:              # anchors off the lattice
+                self._gpu_off = True
+                return None
+        return self._gpu
+
+    def torch_lookup(self, pix_xy, device):
+        """Return the same rows as :meth:`__call__`, on the given device.
+
+        When the anchors sit on a voxel lattice and the device is a CUDA one, the
+        nearest-neighbour search runs on the GPU through :class:`_LatticeKNNPrior`. That is
+        7.5 times the speed of the tree on the mouse kidney section, where the
+        three-dimensional prior had been the host-side stall inside the GPU estimation loop.
+        Otherwise the tree answers on the host and the rows are uploaded.
+
+        The two agree except where several anchors share the ``k_max``-th distance. Which of
+        them take the last slots is arbitrary in both, and the two break the tie differently.
+        On that section this affected 7.7 percent of voxels, with the prior's argmax unchanged
+        on 99.87 percent of them.
+
+        :param pix_xy: Query positions in micrometres.
+        :param device: The torch device to return the rows on.
+        :returns: The row-normalized prior, of shape ``(n, K)``.
+        :rtype: torch.Tensor
+        """
+        import torch
+        gpu = self._lattice(device)
+        if gpu is not None:
+            try:
+                P = gpu(self._query_points(pix_xy))
+                self.last_empty = gpu.last_empty
+                return P
+            except ValueError:              # queries off the anchors' lattice
+                pass
+        return torch.as_tensor(self(pix_xy), device=device)
+
+    def __call__(self, pix_xy, *, batch=2_000_000):
+        """Return the row-normalized prior for a set of queries, on the host.
+
+        :param pix_xy: Query positions in micrometres.
+        :param batch: Number of queries processed per step.
+        :type batch: int
+        :returns: The prior, of shape ``(n, K)`` and dtype float32, where a row with no anchor
+            in range is uniform.
+        :rtype: numpy.ndarray
+        """
+        pix_xy = self._query_points(pix_xy)
+        out = np.empty((len(pix_xy), self.K), dtype=np.float32)
+        n_empty = 0
+        for s in range(0, len(pix_xy), batch):
+            e = min(s + batch, len(pix_xy))
+            dist, idx = self.tree.query(pix_xy[s:e], k=self.k_max,
+                                        distance_upper_bound=self.d_max, workers=-1)
+            if dist.ndim == 1:
+                dist, idx = dist[:, None], idx[:, None]
+            ok = np.isfinite(dist) & (dist < self.d_max)
+            w = np.where(ok, 1.0 - (np.minimum(dist, self.d_max) / self.d_max) ** self.nu,
+                         0.0).astype(np.float32)
+            lab = self.labels[np.where(ok, np.minimum(idx, len(self.labels) - 1), 0)]
+            rows = np.repeat(np.arange(e - s), lab.shape[1])
+            P = np.bincount((rows * self.K + lab.ravel()), weights=w.ravel(),
+                            minlength=(e - s) * self.K).reshape(e - s, self.K)
+            empty = P.sum(1) <= 0
+            n_empty += int(empty.sum())
+            P[empty] = 1.0
+            out[s:e] = (P / P.sum(1, keepdims=True)).astype(np.float32)
+        self.last_empty = n_empty
+        return out
+
+
+class GriddedAnchorPrior:
+    """The prior of :class:`AnchorPrior`, evaluated once as a convolution.
+
+    ``AnchorPrior`` asks a tree for the 48 nearest anchors of every voxel. That costs 36
+    seconds per chunk on a mouse kidney store, two thirds of the whole mapping, and it
+    repeats work, because the prior depends on position only and never on the counts.
+
+    The anchors sit on the same one micrometre lattice as the voxels, since
+    ``downsampled_vectors`` are voxel indices, so the prior is exactly a convolution.
+    Each celltype's anchors are painted into an image and convolved with the compact
+    kernel. Computed once for the tissue, a voxel's prior is then an integer lookup.
+
+    A convolution has no notion of the nearest k, so on its own it would quietly drop the
+    truncation at ``k_max``, and that is not a free improvement. The classes with the most
+    anchors fill those slots, so removing the cut moves 0.08 percent of voxels, nearly all
+    of them toward the proximal tubule. To stay identical to the tree, the number of
+    anchors within ``d_max`` is itself convolved, which is a sum of ones and therefore
+    exact, and the few nodes above ``k_max`` are computed the old way. Passing
+    ``exact_k_max`` as ``False`` keeps the untruncated prior, which is what the model
+    actually specifies.
+    """
+
+    def __init__(self, xy, labels, n_classes, *, d_max=12.0, nu=2.0, k_max=48,
+                 sampling_distance=1.0, origin=None, exact_k_max=True, verbose=False):
+        """Convolve each class's anchors into a lattice-wide prior field.
+
+        An overlap-add convolution leaves about one part in ten million of the signal's scale
+        everywhere, including where no anchor is in range. Row-normalizing would turn that
+        noise into a full prior, so it is cleared first. The smallest weight a real anchor can
+        carry is the kernel evaluated one lattice step inside ``d_max``, and the cut sits an
+        order of magnitude below it.
+
+        :param xy: Anchor positions in micrometres. They must lie on a single depth plane.
+        :param labels: Label of each anchor.
+        :param n_classes: Number of classes.
+        :type n_classes: int
+        :param d_max: Radius beyond which an anchor has no influence, in micrometres.
+        :param nu: Exponent of the compact-support kernel.
+        :param k_max: Largest number of anchors that may contribute to one query.
+        :type k_max: int
+        :param sampling_distance: Lattice spacing in micrometres.
+        :param origin: Lattice origin in micrometres. Defaults to the minimum anchor position.
+        :param exact_k_max: Whether to reproduce the tree's truncation exactly, by answering
+            the few over-full nodes with the tree itself.
+        :type exact_k_max: bool
+        :param verbose: Whether to print the field's size and the number of truncated nodes.
+        :type verbose: bool
+        :raises ValueError: If the anchors span more than one depth plane, in which case the
+            caller should use :class:`AnchorPrior` instead.
+        """
+        xy = np.atleast_2d(np.asarray(xy, dtype=np.float64))
+        # This prior is a 2D convolution over the voxel lattice. Anchors that span depth
+        # need a 3D kernel, and the (nx, ny, nz, K) field that would take is tens of GB
+        # on a whole section, so the caller falls back to the KD-tree AnchorPrior.
+        if xy.shape[1] > 2 and float(np.ptp(xy[:, 2])) > 0:
+            raise ValueError('GriddedAnchorPrior needs anchors on a single z plane; '
+                             'these span depth — use AnchorPrior')
+        xy = np.ascontiguousarray(xy[:, :2])
+        lab = np.asarray(labels)
+        self.K = int(n_classes)
+        self.d_max = float(d_max)
+        self.nu = float(nu)
+        self.sd = float(sampling_distance)
+        ox = float(origin[0]) if origin is not None else float(xy[:, 0].min())
+        oy = float(origin[1]) if origin is not None else float(xy[:, 1].min())
+        r = int(np.ceil(self.d_max / self.sd))
+        ix = np.rint((xy[:, 0] - ox) / self.sd).astype(np.int64)
+        iy = np.rint((xy[:, 1] - oy) / self.sd).astype(np.int64)
+        x0, y0 = int(ix.min()) - r, int(iy.min()) - r
+        nx = int(ix.max()) - x0 + r + 1
+        ny = int(iy.max()) - y0 + r + 1
+        self.ox = ox + x0 * self.sd
+        self.oy = oy + y0 * self.sd
+        yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+        d = np.hypot(xx, yy) * self.sd
+        W = np.where(d < self.d_max,
+                     1.0 - (np.minimum(d, self.d_max) / self.d_max) ** self.nu,
+                     0.0).astype(np.float32)
+        from scipy.signal import oaconvolve
+        field = np.zeros((nx, ny, self.K), dtype=np.float32)
+        for k in range(self.K):
+            m = lab == k
+            if not m.any():
+                continue
+            img = np.zeros((nx, ny), dtype=np.float32)
+            np.add.at(img, (ix[m] - x0, iy[m] - y0), 1.0)
+            field[..., k] = oaconvolve(img, W, mode='same')
+        # An overlap-add FFT leaves ~1e-7 of the signal's scale everywhere, including
+        # where no anchor is in range. Row-normalising turns that noise into a full
+        # prior, so it is cleared first: the smallest weight a real anchor can carry is
+        # 1 - ((d_max - sd) / d_max)^nu, and the cut sits an order of magnitude below it.
+        w_min = 1.0 - ((self.d_max - self.sd) / self.d_max) ** self.nu
+        field[field < np.float32(w_min * 0.1)] = 0.0
+        # Where more anchors than k_max are in range the KD-tree truncates; those
+        # nodes are marked here (the count is a convolution of ones, hence exact) and
+        # answered by the KD-tree at lookup time.
+        self.k_max = int(k_max)
+        self.exact_k_max = bool(exact_k_max)
+        self._tree = None
+        self._lab = lab
+        self.trunc = None
+        if self.exact_k_max:
+            disc = (d < self.d_max).astype(np.float32)
+            img = np.zeros((nx, ny), dtype=np.float32)
+            np.add.at(img, (ix - x0, iy - y0), 1.0)
+            cnt = np.rint(oaconvolve(img, disc, mode='same'))
+            self.trunc = cnt > self.k_max
+            if self.trunc.any():
+                from scipy.spatial import cKDTree
+                self._tree = cKDTree(np.asarray(xy, dtype=np.float64))
+                if verbose:
+                    print(f'[lda] {int(self.trunc.sum()):,} lattice nodes hold more '
+                          f'than k_max={self.k_max} anchors; those keep the KD-tree '
+                          f'answer')
+            else:
+                self.trunc = None
+        tot = field.sum(2, keepdims=True)
+        self.empty = (tot[..., 0] <= 0)
+        np.divide(field, np.maximum(tot, 1e-30), out=field)
+        field[self.empty] = 1.0 / self.K            # no anchor in range -> uniform
+        self.nx, self.ny = nx, ny
+        self._flat = np.ascontiguousarray(field.reshape(-1, self.K))
+        self.last_empty = 0
+        self._t = None
+        if verbose:
+            print(f'[lda] gridded anchor prior {nx}x{ny}x{self.K} '
+                  f'({self._flat.nbytes / 1e9:.2f} GB), kernel radius {r} px')
+
+    def to_torch(self, device):
+        """Upload the precomputed prior field to a device.
+
+        :param device: The torch device to upload to.
+        :returns: This prior.
+        :rtype: GriddedAnchorPrior
+        """
+        import torch
+        self._t = torch.as_tensor(self._flat, device=device)
+        return self
+
+    def _index(self, pix_xy):
+        """Map query positions to flat indices into the precomputed field.
+
+        Positions outside the field are clamped to its edge.
+
+        :param pix_xy: Query positions in micrometres.
+        :returns: One flat index per query.
+        :rtype: numpy.ndarray
+        """
+        xy = np.asarray(pix_xy)
+        ix = np.clip(np.rint((xy[:, 0] - self.ox) / self.sd), 0,
+                     self.nx - 1).astype(np.int64)
+        iy = np.clip(np.rint((xy[:, 1] - self.oy) / self.sd), 0,
+                     self.ny - 1).astype(np.int64)
+        return ix * self.ny + iy
+
+    def _exact_rows(self, pix_xy, sel):
+        """Compute the tree prior for the handful of positions truncation applies to.
+
+        The caller may pass three-dimensional positions while this prior's tree is built on
+        two, which happens for a planar lattice over transcripts that carry depth, as on CosMx
+        whole slides. The query is therefore made in the tree's own dimensionality, and the
+        extra column is the one the gridded field already ignores.
+
+        :param pix_xy: All query positions.
+        :param sel: Indices of the queries that need the exact answer.
+        :returns: The row-normalized prior for those queries.
+        :rtype: numpy.ndarray
+        """
+        from scipy.spatial import cKDTree
+        # the caller may pass (x, y, z) while this prior's tree is built on (x, y) alone -- a 2D
+        # lattice over transcripts that carry a z (CosMx whole slides). Query in the tree's own
+        # dimensions; the extra column is the one the gridded field already ignores.
+        q = np.asarray(pix_xy)[sel][:, :self._tree.m]
+        dist, idx = self._tree.query(q, k=self.k_max,
+                                     distance_upper_bound=self.d_max, workers=-1)
+        if dist.ndim == 1:
+            dist, idx = dist[:, None], idx[:, None]
+        ok = np.isfinite(dist) & (dist < self.d_max)
+        w = np.where(ok, 1.0 - (np.minimum(dist, self.d_max) / self.d_max) ** self.nu,
+                     0.0).astype(np.float32)
+        lab = self._lab[np.where(ok, np.minimum(idx, len(self._lab) - 1), 0)]
+        rows = np.repeat(np.arange(len(q)), lab.shape[1])
+        P = np.bincount((rows * self.K + lab.ravel()), weights=w.ravel(),
+                        minlength=len(q) * self.K).reshape(len(q), self.K)
+        empty = P.sum(1) <= 0
+        P[empty] = 1.0
+        return (P / P.sum(1, keepdims=True)).astype(np.float32)
+
+    def __call__(self, pix_xy, *, batch=None):
+        """Look the prior up for a set of queries, on the host.
+
+        :param pix_xy: Query positions in micrometres.
+        :param batch: Accepted for signature compatibility with :class:`AnchorPrior` and
+            otherwise unused, because the lookup is already a single gather.
+        :returns: The row-normalized prior, of shape ``(n, K)``.
+        :rtype: numpy.ndarray
+        """
+        flat = self._index(pix_xy)
+        self.last_empty = int(self.empty.reshape(-1)[flat].sum())
+        out = self._flat.take(flat, axis=0)
+        if self.trunc is not None:
+            sel = np.flatnonzero(self.trunc.reshape(-1)[flat])
+            if sel.size:
+                out = out.copy()
+                out[sel] = self._exact_rows(pix_xy, sel)
+        return out
+
+    def torch_lookup(self, pix_xy, device):
+        """Look the prior up for a set of queries, on the given device.
+
+        The field is uploaded on first use. Any query whose node exceeds ``k_max`` is replaced
+        by the exact tree answer.
+
+        :param pix_xy: Query positions in micrometres.
+        :param device: The torch device to return the rows on.
+        :returns: The row-normalized prior, of shape ``(n, K)``.
+        :rtype: torch.Tensor
+        """
+        import torch
+        idx = self._index(pix_xy)
+        if self._t is None:
+            self.to_torch(device)
+        out = self._t.index_select(0, torch.as_tensor(idx, device=device))
+        if self.trunc is not None:
+            sel = np.flatnonzero(self.trunc.reshape(-1)[idx])
+            if sel.size:
+                out[torch.as_tensor(sel, device=device)] = torch.as_tensor(
+                    self._exact_rows(pix_xy, sel), device=device)
+        return out
+
+
+def _with_z(pix_xy, pix_z=None):
+    """Attach a depth column to planar positions, when the caller has one.
+
+    :param pix_xy: Positions, either planar or already carrying depth.
+    :param pix_z: The depth to attach, or ``None`` to leave the positions alone.
+    :returns: The positions, with depth where it was available.
+    :rtype: numpy.ndarray
+    """
+    if pix_z is None:
+        return pix_xy
+    xy = np.atleast_2d(np.asarray(pix_xy))
+    if xy.shape[1] > 2:
+        return xy
+    return np.column_stack([xy, np.asarray(pix_z, dtype=xy.dtype).reshape(-1)])
+
+
+class LDAScorer:
+    """Turn a chunk of voxel counts and positions into a label and a posterior.
+
+    The dictionary proposes and the prior ranks, as the module docstring explains, in
+    three steps.
+
+    First the ``unknown`` classes are taken out of the running. The annotation abstained
+    there, so they are a label for a voxel nobody claims, not a candidate that should beat
+    a real celltype because it happens to have an anchor nearby.
+
+    Then the candidates are every class within ``cand_nats`` of the best log-likelihood.
+    One nat is a factor of e, and anything further behind is not a close call.
+
+    Finally, among those candidates, ``prior_weight`` times the logarithm of the floored
+    prior is added. The floor is what makes the prior a weight rather than a veto: a class
+    with no anchor in range pays a constant penalty and still wins wherever the likelihood
+    is far enough ahead.
+
+    Measured on mouse kidney Xenium against a reference segmentation labelled by an
+    independent single-nucleus judge, voxel accuracy rose from 78.3 to 82.7 percent, macro
+    F1 from 62.9 to 73.2, and the share of fibroblast nucleus voxels recovered from 43.4
+    to 78.7 percent.
+    """
+
+    def __init__(self, beta, prior=None, unknown=None, *, cand_nats=1.0,
+                 prior_weight=0.5, prior_floor=0.02):
+        """Normalize the dictionary, take its logarithm, and record the decision settings.
+
+        A gene the panel never detected anywhere is zero in every factor, because its
+        tissue-wide background rate is zero and :func:`_marker_aware_beta` hands the whole
+        column back as zero. Taking a logarithm would make that column minus infinity, and the
+        matrix multiply would turn the product of a zero count and minus infinity into
+        not-a-number for every voxel that does not carry the gene. One such gene is enough to
+        poison the whole score matrix, after which the argmax lands on class zero everywhere
+        and the posterior is not-a-number, so ``filter_celltypemaps`` drops the entire map. The
+        floor applied here sits far below any real rate, and the entry is only ever multiplied
+        by a zero count, so it changes no score that matters.
+
+        :param beta: The per-celltype gene distributions, of shape ``(K, G)``.
+        :param prior: The anchor prior, or ``None`` to score on the likelihood alone.
+        :param unknown: Boolean mask of the classes that must never win.
+        :param cand_nats: How far behind the best log-likelihood a class may be and still be a
+            candidate.
+        :type cand_nats: float
+        :param prior_weight: Weight applied to the logarithm of the prior.
+        :type prior_weight: float
+        :param prior_floor: Floor applied to the prior before its logarithm is taken.
+        :type prior_floor: float
+        """
+        beta = np.asarray(beta, dtype=np.float64)
+        beta = beta / beta.sum(1, keepdims=True)
+        # A gene the panel never detected anywhere is 0 in EVERY factor (its
+        # tissue-wide background rate is 0, so _marker_aware_beta hands the whole
+        # column back as 0). log would make that column -inf, and the matmul turns
+        # the 0 * -inf of every voxel that does not carry the gene into NaN — ONE
+        # such gene NaNs the whole score matrix, after which argmax lands on class 0
+        # everywhere and the posterior is NaN, so filter_celltypemaps drops the
+        # entire map. The floor sits far below any real rate and the entry is only
+        # ever multiplied by a zero count, so it changes no score that matters.
+        np.maximum(beta, 1e-12, out=beta)
+        self.log_beta = np.log(beta).astype(np.float32)
+        self.prior = prior
+        self.K = beta.shape[0]
+        self.unknown = (np.zeros(self.K, dtype=bool) if unknown is None
+                        else np.asarray(unknown, dtype=bool).reshape(self.K))
+        self.cand_nats = float(cand_nats)
+        self.prior_weight = float(prior_weight)
+        self.prior_floor = float(prior_floor)
+
+    def to_torch(self, device):
+        """Move the dictionary, and whatever the prior holds, to a device.
+
+        The producer already has the field on the device, so scoring there as well removes one
+        host copy of shape voxels by genes per chunk, which is 1.7 gigabytes on this store,
+        together with the host-side work behind it. The results differ only by the order of
+        float32 summation.
+
+        :param device: The torch device to move to.
+        :returns: This scorer.
+        :rtype: LDAScorer
+        """
+        import torch
+        self._dev = device
+        self._tlb = torch.as_tensor(self.log_beta, device=device)
+        self._tunk = torch.as_tensor(self.unknown, device=device)
+        if self.prior is not None and hasattr(self.prior, 'to_torch'):
+            self.prior.to_torch(device)
+        return self
+
+    def torch_call(self, counts_t, pix_xy=None, pix_z=None):
+        """Score a chunk from a torch tensor of counts, with no host round trip.
+
+        :param counts_t: The counts, of shape ``(n, G)``, on the device.
+        :param pix_xy: Voxel centres in micrometres, for the anchor prior.
+        :param pix_z: Voxel depth in micrometres, used when the anchors carry depth.
+        :returns: A pair holding the labels as int32 and the posteriors as float32.
+        :rtype: tuple of numpy.ndarray
+        """
+        return self.torch_call_ll(counts_t @ self._tlb.T, pix_xy, pix_z)
+
+    def torch_call_ll(self, Z, pix_xy=None, pix_z=None):
+        """Score a chunk from a log-likelihood that is already on the device.
+
+        The likelihood is the only thing the counts are needed for, and it can be formed
+        without ever building the matrix of voxels by genes. See :func:`map_lda`, where the
+        field block is contracted gene-first instead. Splitting the step out here lets the
+        caller skip that matrix, which on a whole-brain count field is several gigabytes per
+        band.
+
+        :param Z: The log-likelihood, of shape ``(n, K)``, on the device.
+        :param pix_xy: Voxel centres in micrometres, for the anchor prior.
+        :param pix_z: Voxel depth in micrometres, used when the anchors carry depth.
+        :returns: A pair holding the labels as int32 and the posteriors as float32.
+        :rtype: tuple of numpy.ndarray
+        """
+        import torch
+        NEG = float(np.finfo(np.float32).min / 4)
+        Z = Z.masked_fill(self._tunk.unsqueeze(0), NEG)
+        cand = Z >= (Z.max(1, keepdim=True).values - self.cand_nats)
+        if self.prior is not None and pix_xy is not None:
+            P = self.prior.torch_lookup(_with_z(pix_xy, pix_z), Z.device)
+            Z = Z + self.prior_weight * P.clamp_min(self.prior_floor).log()
+        Z = torch.softmax(Z.masked_fill(~cand, NEG), dim=1)
+        best = Z.max(1)
+        return (best.indices.to(torch.int32).cpu().numpy(),
+                best.values.to(torch.float32).cpu().numpy())
+
+    def __call__(self, counts, pix_xy=None, pix_z=None):
+        """Score a chunk of counts on the host.
+
+        :param counts: The counts, of shape ``(n, G)``.
+        :param pix_xy: Voxel centres in micrometres, for the anchor prior.
+        :param pix_z: Voxel depth in micrometres. This is used when the anchors carry depth
+            themselves; with single-plane anchors it changes no distance.
+        :returns: A pair holding the labels as int32 and the posteriors as float32.
+        :rtype: tuple of numpy.ndarray
+        """
+        NEG = np.float32(-1e30)
+        Z = np.asarray(counts, dtype=np.float32) @ self.log_beta.T
+        Z[:, self.unknown] = NEG
+        cand = Z >= Z.max(1, keepdims=True) - np.float32(self.cand_nats)
+        if self.prior is not None and pix_xy is not None:
+            P = self.prior(_with_z(pix_xy, pix_z))
+            Z = Z + np.float32(self.prior_weight) * np.log(
+                np.maximum(P, np.float32(self.prior_floor))).astype(np.float32)
+        Z = np.where(cand, Z, NEG).astype(np.float32)
+        Z -= Z.max(1, keepdims=True)
+        np.exp(Z, out=Z)
+        Z /= Z.sum(1, keepdims=True)
+        return Z.argmax(1).astype(np.int32), Z.max(1).astype(np.float32)
+
+
+def _marker_mean_matrix(index_sets, n_genes, n_classes):
+    """Build the matrix that turns a count block into each celltype's own-marker mean.
+
+    Multiplying counts by the returned matrix gives the same quantity
+    :func:`ssaft._marker_corr.marker_score` computes by indexing, written as a contraction
+    so that the device can do it in one matrix multiply.
+
+    :param index_sets: One entry per celltype, each either an array of owned gene
+        positions or ``None``.
+    :param n_genes: Number of genes, which is the height of the result.
+    :type n_genes: int
+    :param n_classes: Number of celltypes, which is the width of the result.
+    :type n_classes: int
+    :returns: The matrix, of shape ``(G, K)`` and dtype float32.
+    :rtype: numpy.ndarray
+    """
+    M = np.zeros((int(n_genes), int(n_classes)), dtype=np.float32)
+    for k, idx in enumerate(index_sets or []):
+        if k >= M.shape[1] or idx is None or not len(idx):
+            continue
+        idx = np.asarray(idx, dtype=np.int64)
+        M[idx, k] = 1.0 / len(idx)
+    return M
+
+
+def map_lda(analysis, *, centroids=None, vf_norm_threshold=None, chunk_h=128,
+            overwrite=True, gene_indices=None, size_after_normalization=10.0,
+            veff=1.0, d_max=12.0, nu=2.0, k_max=48, use_anchor_prior=True,
+            anchor_xy=None, anchor_labels=None, beta=None, marker_idx=None,
+            marker_sets=None, device=None, gridded_prior=True,
+            cand_nats=1.0, prior_weight=0.5, prior_floor=0.02,
+            gpu_target_bytes=int(4e9), sub_batch=None):
+    """Map the count and blur field with the FICTURE-style scorer.
+
+    This is the array-backend counterpart of :func:`ssaft._count.map_corr` and
+    :func:`ssaft._gnb.map_gnb`. It writes ``celltype_maps`` together with
+    ``max_probabilities``, because the score is a posterior and ``filter_celltypemaps``
+    therefore thresholds it with ``min_p``.
+
+    :param analysis: The analysis whose dataset and store are read and written.
+    :param centroids: Accepted for signature parity and otherwise unused, because the
+        factors come from the annotated vectors rather than from the centroids.
+    :param vf_norm_threshold: Density below which a voxel is left unmapped. Resolved from
+        the store when ``None``.
+    :param chunk_h: Number of raster rows per band, before any reduction to fit the
+        memory budget.
+    :type chunk_h: int
+    :param overwrite: Whether to replace existing map arrays in the store.
+    :type overwrite: bool
+    :param gene_indices: Positions into the store's gene axis to keep.
+    :param size_after_normalization: The size each vector was normalized to.
+    :param veff: Molecule-count scale for the density. One is right for the count backend,
+        whose ``vf_norm`` already counts molecules per bin.
+    :param d_max: Anchor influence radius in micrometres. It should be larger than the
+        anchor spacing and smaller than a cell diameter.
+    :param nu: Exponent of the compact-support kernel.
+    :param k_max: Largest number of anchors that may contribute to one voxel.
+    :type k_max: int
+    :param use_anchor_prior: Pass ``False`` to score on the likelihood alone.
+    :type use_anchor_prior: bool
+    :param anchor_xy: Explicit anchor positions, read from the store when ``None``.
+    :param anchor_labels: Explicit anchor labels, read from the store when ``None``.
+    :param beta: An explicit dictionary, built by :func:`build_factors` when ``None``.
+    :param marker_idx: Older per-celltype marker gene positions, used for the marker score
+        only when ``marker_sets`` is absent. See
+        :func:`ssaft._marker_corr.marker_index_sets`. They index the mapped gene axis.
+        When given, ``celltype_marker_score`` is written alongside the map so that
+        ``filter_celltypemaps`` can threshold each celltype on its own markers.
+    :param marker_sets: Per-celltype positions of the genes a celltype owns, used to build
+        the dictionary; see :func:`build_factors`. Unlike ``marker_idx`` this has no
+        minimum-marker fallback, because a celltype with a single marker still needs that
+        marker recognised as its own, or the dictionary would send it to background.
+    :param device: CUDA device for the scoring, for example ``'cuda'`` or ``'cuda:1'``.
+        Leaving it at ``None`` keeps everything on the processor. The field still comes off
+        disk on the host, since that part is input and output, but the likelihood is a
+        matrix multiply of voxels by genes against genes by celltypes, which is what the
+        card is for. The function falls back to the processor, with a message, when torch
+        or CUDA is unavailable.
+    :param gridded_prior: Whether to build the anchor prior as a precomputed convolution
+        when the anchors sit on the voxel lattice, as described under
+        :class:`GriddedAnchorPrior`, which also keeps the lookup on the device. Passing
+        ``False`` forces the tree version.
+    :type gridded_prior: bool
+    :param cand_nats: How far behind the best log-likelihood a class may be and still be a
+        candidate, as described under :class:`LDAScorer`. Because the anchor prior only
+        ranks what the dictionary proposed, it can no longer veto a celltype outright.
+    :type cand_nats: float
+    :param prior_weight: Weight on the logarithm of the anchor prior.
+    :type prior_weight: float
+    :param prior_floor: Floor applied to the prior before its logarithm is taken. This is
+        what turns the absence of an anchor from a veto into a constant penalty.
+    :type prior_floor: float
+    :param gpu_target_bytes: Device memory budget for one band of the field. The number of
+        rows per band is reduced to fit it, through
+        :func:`ssaft._count.band_rows_for_budget`, so that a wide gene axis cannot run the
+        card out of memory the way a fixed row count can.
+    :type gpu_target_bytes: int
+    :param sub_batch: Voxels scored per device batch inside a band. It is sized from the
+        same budget when ``None``, and bounds the one temporary that scales with the gene
+        axis.
+    :returns: Whatever ``_write_maps`` returns after writing the label raster and the
+        posteriors into the store.
+
+    Notes
+    -----
+    On a CUDA device the field is never transposed or gathered on the host. The band is
+    uploaded as it sits on disk, with genes first, and the likelihood is contracted
+    gene-first as
+
+        Z[m, k] = s[m] * sum over g of expm1(v[g, m]) * log_beta[k, g]
+
+    where ``s`` is the per-voxel scalar ``veff * vf_norm / size_after_normalization``.
+    That is the same number the host path computes as ``_pseudo_counts(...)`` multiplied
+    by the transposed dictionary, but it needs neither the transpose, since the field is
+    gene-major on disk and voxel-major in the older expression, nor the count matrix of
+    voxels by genes. On a whole-brain field of 3.8 thousand genes those two copies
+    accounted for about 2.8 seconds of the roughly 5.9 seconds each band cost, against
+    0.03 seconds for the matrix multiply itself.
+    """
+    from tqdm.auto import tqdm
+    from ._count import _write_maps
+
+    zg = analysis.dataset.zarr_group
+    ds = analysis.dataset
+    vf = zg['vf_normalized']
+    n_G, n_R, n_C = vf.shape
+    norm = np.asarray(zg['vf_norm'][:])
+    sd = float(getattr(ds, 'sampling_distance', None)
+               or zg.attrs.get('sampling_distance', zg.attrs.get('bin_size_um', 1.0)))
+    from ._count import resolve_vf_norm_threshold
+    vf_norm_threshold = resolve_vf_norm_threshold(zg, vf_norm_threshold)
+
+    gi = None if gene_indices is None else np.asarray(sorted(gene_indices), np.int64)
+    if beta is None:
+        beta, _ = build_factors(zg, gene_indices=gi, veff=veff,
+                                size_after_normalization=size_after_normalization,
+                                sampling_distance=sd, verbose=analysis.verbose)
+    prior = None
+    if use_anchor_prior:
+        if anchor_xy is None:
+            anchor_xy, anchor_labels = anchor_positions(zg, sampling_distance=sd)
+        prior = analysis._make_anchor_prior(
+            (anchor_xy, anchor_labels), beta.shape[0], sd,
+            dict(d_max=d_max, nu=nu, k_max=k_max, gridded_prior=gridded_prior))
+
+    off = np.asarray(zg['coordinate_offset'][:], dtype=np.float64) \
+        if 'coordinate_offset' in zg else np.zeros(3)
+    _unk = np.zeros(beta.shape[0], dtype=bool)
+    _unk[[i for i in analysis._unknown_class_ids() if i < beta.shape[0]]] = True
+    scorer = LDAScorer(beta, prior=prior, unknown=_unk, cand_nats=cand_nats,
+                       prior_weight=prior_weight, prior_floor=prior_floor)
+    _dev = None
+    if device is not None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                _dev = torch.device(device)
+                scorer.to_torch(_dev)
+            else:
+                analysis._m('map_celltypes (lda): CUDA not available, scoring on CPU')
+        except ImportError:
+            analysis._m('map_celltypes (lda): torch not installed, scoring on CPU')
+    M = np.full((n_R, n_C), -1, dtype=np.int32)
+    P = np.full((n_R, n_C), -1.0, dtype=np.float32)
+    # The per-gene field only exists inside this loop, so the marker level a voxel
+    # would be filtered on has to be taken here (see ssaft._marker_corr.marker_score).
+    # The score's axis is each celltype's OWN markers with no MIN_MARKER_GENES
+    # fallback: that fallback exists so a 2-point Pearson stays filterable, and a mean
+    # over one gene has no such degeneracy. Falling back to it here would leave a
+    # 1-2 marker celltype scored 0 -> no cutoff -> no filtering at all.
+    score_idx = marker_sets if marker_sets is not None else marker_idx
+    MS = np.zeros((n_R, n_C), dtype=np.float32) if score_idx is not None else None
+    _Mfull_t = None
+
+    if _dev is not None:
+        from ._count import band_rows_for_budget
+        chunk_h = band_rows_for_budget(n_G, n_C, chunk_h,
+                                       budget_bytes=gpu_target_bytes)
+        if sub_batch is None:
+            # the one temporary that scales with the gene axis is (n_G x sub_batch);
+            # a quarter of the budget, so it sits alongside the band rather than
+            # competing with it
+            sub_batch = max(4096, int(gpu_target_bytes // 16) // max(n_G, 1))
+        # The dictionary is expanded back onto the FULL gene axis, zeros at the
+        # excluded genes. Their coefficient is then 0, so the contraction is the same
+        # number as subsetting the block would give -- and the block, which is the big
+        # array, never has to be gathered along its gene axis at all.
+        _tlb_full = scorer._tlb
+        if gi is not None:
+            import torch
+            _tlb_full = torch.zeros((scorer.K, n_G), device=_dev,
+                                    dtype=scorer._tlb.dtype)
+            _tlb_full[:, torch.as_tensor(gi, device=_dev)] = scorer._tlb
+        if analysis.verbose:
+            analysis._m(f'map_celltypes (lda): {chunk_h} rows/band '
+                        f'({n_G * chunk_h * n_C * 4 / 2**30:.2f} GiB), '
+                        f'{sub_batch} voxels/batch')
+
+    bands = [(r0, min(r0 + chunk_h, n_R)) for r0 in range(0, n_R, chunk_h)]
+    bands = [(a, b) for a, b in bands if (norm[a:b] > vf_norm_threshold).any()]
+    from ._count import iter_field_bands
+    it = iter_field_bands(zg, bands)
+    if analysis.verbose:
+        it = tqdm(it, total=len(bands), desc='map_celltypes (lda)')
+    for r0, r1, raw in it:
+        h = r1 - r0
+        flat = (norm[r0:r1] > vf_norm_threshold).reshape(-1)
+        pos = np.where(flat)[0]
+        xy = None
+        if prior is not None:
+            rr, cc = np.divmod(pos, n_C)        # grid indices: column = x, row = y
+            xy = np.stack([cc * sd + off[0], (rr + r0) * sd + off[1]], 1)
+        nf = norm[r0:r1].reshape(-1)[pos]
+        if _dev is None:
+            block = raw.reshape(n_G, h * n_C).T
+            if gi is not None:
+                block = block[:, gi]
+            X = _pseudo_counts(block[pos], nf, size_after_normalization, veff,
+                               dtype=np.float32)
+            lab, sc = scorer(X, xy)
+            _msv = None
+            if MS is not None:
+                from ._marker_corr import marker_score
+                _msv = marker_score(X / max(veff, 1e-12), lab, score_idx)
+            del block, X
+        else:
+            import torch
+            Bt = torch.as_tensor(raw.reshape(n_G, h * n_C), device=_dev)
+            if MS is not None and _Mfull_t is None:
+                _Mm = _marker_mean_matrix(score_idx,
+                                          len(gi) if gi is not None else n_G,
+                                          beta.shape[0])
+                _Mfull_t = torch.zeros((n_G, beta.shape[0]), device=_dev)
+                if gi is not None:
+                    _Mfull_t[torch.as_tensor(gi, device=_dev)] = \
+                        torch.as_tensor(_Mm, device=_dev)
+                else:
+                    _Mfull_t = torch.as_tensor(_Mm, device=_dev)
+            pos_t = torch.as_tensor(pos, device=_dev)
+            s_t = (torch.as_tensor(nf, device=_dev, dtype=torch.float32)
+                   * (float(veff) / float(size_after_normalization)))
+            lab = np.empty(pos.size, np.int32); sc = np.empty(pos.size, np.float32)
+            _msv = np.empty(pos.size, np.float32) if MS is not None else None
+            for a in range(0, pos.size, sub_batch):
+                b = min(pos.size, a + sub_batch)
+                # gene-major slice of THIS batch's voxels; no host copy, no transpose
+                W = torch.expm1_(Bt.index_select(1, pos_t[a:b]))
+                sb = s_t[a:b].unsqueeze(1)
+                Z = (_tlb_full @ W).T * sb
+                lab[a:b], sc[a:b] = scorer.torch_call_ll(
+                    Z, None if xy is None else xy[a:b])
+                if MS is not None:
+                    ms = (_Mfull_t.T @ W).T * sb
+                    _msv[a:b] = (ms.gather(
+                        1, torch.as_tensor(lab[a:b], device=_dev).long().unsqueeze(1))
+                        .squeeze(1) / max(veff, 1e-12)).cpu().numpy()
+                    del ms
+                del W, Z
+            del Bt, pos_t, s_t
+            torch.cuda.empty_cache()
+        mf = M[r0:r1].reshape(-1); pf = P[r0:r1].reshape(-1)
+        mf[pos] = lab
+        pf[pos] = sc
+        M[r0:r1] = mf.reshape(h, n_C); P[r0:r1] = pf.reshape(h, n_C)
+        if MS is not None:
+            sf = MS[r0:r1].reshape(-1)
+            sf[pos] = _msv
+            MS[r0:r1] = sf.reshape(h, n_C)
+        del raw
+    if analysis.verbose:
+        _sig = int((norm > vf_norm_threshold).sum()); _tot = int((norm > 0).sum())
+        print(f'[lda] assigned {int((M >= 0).sum())} voxels '
+              f'(vf_norm>{vf_norm_threshold:.4g} keeps {_sig}/{_tot} = {_sig/max(_tot,1):.1%} of the field)')
+    out = _write_maps(zg, ds, M, P, sd, overwrite=overwrite,
+                      score_key='max_probabilities', method='lda')
+    if MS is not None:
+        if 'celltype_marker_score' in zg:
+            del zg['celltype_marker_score']
+        zg['celltype_marker_score'] = MS.T[:, :, None].astype(np.float32)
+        ds.celltype_marker_score = np.asarray(zg['celltype_marker_score'][:])
+    return out
