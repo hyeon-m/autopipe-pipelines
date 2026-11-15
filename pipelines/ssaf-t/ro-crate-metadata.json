@@ -191,5 +191,6 @@
       "encodingFormat": "image/png",
       "name": "cell-type map preview"
     }
-  ]
+  ],
+  "version": "1.0.0"
 }
