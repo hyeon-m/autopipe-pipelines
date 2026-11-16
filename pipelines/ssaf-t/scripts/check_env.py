@@ -39,6 +39,25 @@ def login(host: str) -> tuple[Path, str | None]:
         f = Path(os.environ.get(var, Path.home() / ".codex")) / "auth.json"
     if f.exists() or os.environ.get(key):
         return f, None
+    # AutoPipe records the CLIs whose login it mounted (`llm_cli` of the run record). Empty there means it did
+    # not mount any: it did not read this pipeline's `llmCli`, which happens when the image was built from a
+    # folder outside the workspace the run was started from. Logging in on the server again does not help then.
+    rec = None
+    for d in [Path.cwd().resolve(), *Path.cwd().resolve().parents]:
+        if (d / RUN_RECORD).is_file():
+            try:
+                rec = json.loads((d / RUN_RECORD).read_text())
+            except (OSError, ValueError):
+                rec = None
+            break
+    if isinstance(rec, dict) and not rec.get("llm_cli"):
+        return f, (f"No {name} login in the container ({f} does not exist): AutoPipe mounted no AI CLI login "
+                   f"for this run (its run record has no `llm_cli`), so it did not read this pipeline's "
+                   f"ro-crate-metadata.json. This happens when the image was built from a pipeline folder "
+                   f"outside the workspace the run was started from (the image's label "
+                   f"org.autopipe.pipeline_dir names that folder). Start the run from the workspace that holds "
+                   f"that folder, or build the image again from this workspace's pipeline folder. The server "
+                   f"login itself is not the problem; do not log in again for this.")
     return f, (f"No {name} login in the container ({f} does not exist). The annotation uses the server user's "
                f"{name} login, which AutoPipe mounts into the container from version {AUTOPIPE_MIN} on: run this "
                f"pipeline with AutoPipe {AUTOPIPE_MIN} or later. With such a version, check that the server user "
