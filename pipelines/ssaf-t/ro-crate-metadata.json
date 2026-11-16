@@ -99,7 +99,7 @@
           "@id": "#rapids-singlecell"
         }
       ],
-      "version": "1.0.1"
+      "version": "1.0.2"
     },
     {
       "@id": "#author",
@@ -192,5 +192,5 @@
       "name": "cell-type map preview"
     }
   ],
-  "version": "1.0.1"
+  "version": "1.0.2"
 }
