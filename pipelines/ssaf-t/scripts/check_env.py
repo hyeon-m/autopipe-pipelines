@@ -97,12 +97,63 @@ def codex_config_model() -> str | None:
         return None
 
 
+def codex_session_models(evs: list[dict]) -> list[str]:
+    """Models of a Codex session and of every subagent it spawned, read from the session files Codex
+    writes under $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<thread id>.jsonl. `codex exec --json` does
+    not report the model, but each `turn_context` line of a session file does, and the first line of a
+    subagent's file (session_meta) names its parent thread. The session is found by the thread id of
+    its `thread.started` event, so a concurrent run on the same login is never mixed in."""
+    tid = next((str(e["thread_id"]) for e in evs if e.get("type") == "thread.started" and e.get("thread_id")), None)
+    root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+    if not tid or not root.is_dir():
+        return []
+    main = sorted(root.glob(f"*/*/*/rollout-*-{tid}.jsonl"))
+    if not main:
+        return []
+    # subagents start after the main session: its day folder and any later ones (a run past midnight)
+    day0 = main[0].parent
+    days = sorted(d for d in root.glob("*/*/*") if d.is_dir() and d.relative_to(root).parts >= day0.relative_to(root).parts)
+    parent = {}
+    for d in days:
+        for f in d.glob("rollout-*.jsonl"):
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    meta = json.loads(fh.readline()).get("payload") or {}
+            except (OSError, ValueError):
+                continue
+            if meta.get("id"):
+                parent[str(meta["id"])] = (str(meta.get("parent_thread_id") or ""), f)
+    keep, grew = {tid}, True
+    while grew:   # the main thread and its descendants (a lead's judges are depth 2)
+        grew = False
+        for i, (p, _) in parent.items():
+            if p in keep and i not in keep:
+                keep.add(i)
+                grew = True
+    files = [main[0]] + sorted(f for i, (_, f) in parent.items() if i in keep and f != main[0])
+    seen = []
+    for f in files:
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"turn_context"' not in line:
+                        continue
+                    m = (json.loads(line).get("payload") or {}).get("model")
+                    if m and m not in seen:
+                        seen.append(str(m))
+        except (OSError, ValueError):
+            continue
+    return seen
+
+
 def used_models(evs: list[dict], host: str, asked: str | None) -> dict:
     """The model that ran a session, from its JSON events.
 
     claude: the init event's `model` (the session's model) and the result's `modelUsage` (every model
     the session called, e.g. a subagent's). codex: any `model` field of its events; when the CLI reports
-    none, the model asked for or the config.toml default, marked as not reported."""
+    none, the models in Codex's own session files (codex_session_models: the session and its
+    subagents); when those cannot be read either, the model asked for or the config.toml default.
+    Neither is reported by the CLI (`reported_by_cli: false`); `model_source` says where it came from."""
     if host == "claude":
         main = next((e["model"] for e in evs if e.get("type") == "system" and e.get("model")), None)
         every = []
@@ -110,13 +161,18 @@ def used_models(evs: list[dict], host: str, asked: str | None) -> dict:
             every += list((e.get("modelUsage") or {}).keys())
         every = list(dict.fromkeys(([main] if main else []) + every))
         return {"model_used": main or (every[0] if len(every) == 1 else None), "models_called": every,
-                "reported_by_cli": bool(every)}
+                "reported_by_cli": bool(every), "model_source": "cli events" if every else "unknown"}
     every = list(dict.fromkeys(m for e in evs for m in _fields(e, "model")))
     if every:
-        return {"model_used": every[0], "models_called": every, "reported_by_cli": True}
+        return {"model_used": every[0], "models_called": every, "reported_by_cli": True, "model_source": "cli events"}
+    files = codex_session_models(evs)
+    if files:
+        return {"model_used": files[0], "models_called": files, "reported_by_cli": False,
+                "model_source": "codex session files"}
     guess = asked or codex_config_model()
     return {"model_used": guess or "(codex default; the CLI did not report its name)", "models_called": [],
-            "reported_by_cli": False}
+            "reported_by_cli": False,
+            "model_source": "llm_model" if asked else ("config.toml" if guess else "unknown")}
 
 
 def reply_text(evs: list[dict], raw: str) -> str:

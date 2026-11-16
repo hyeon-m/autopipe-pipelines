@@ -304,15 +304,18 @@ names the GPU by its container number only.
 - It uses the Claude or ChatGPT login of the server user (no API key; never put one in the
   pipeline) and that subscription's quota; a batch uses it once per sample, and `replicates` (3 by
   default) multiplies the use of each annotation.
-- The model is `llm_model` (chat setup proposes the model of the AI doing the setup, and the user
-  confirms it), or the CLI's default when blank. When the run starts, `check_env` sends the CLI one
-  short prompt with that model on the server user's account; if the account cannot use it (an unknown
-  name, a model the plan does not include, no quota), the run stops there with the CLI's reason,
-  before any stage. The model that answered is recorded as `model_used` in `00_check/env.json`, and
-  the model the annotation session ran on in `05_annotation/summary.json` (`model_used`, plus
-  `models_called` when a subagent used another model). Claude Code reports the model in its JSON
-  output; Codex does not, so for Codex `model_used` is `llm_model` or the `model` of the mounted
-  `config.toml`, marked `reported_by_cli: false`.
+- The CLI is `annotate_host` and the model is `llm_model` (chat setup proposes the CLI and the model
+  of the AI doing the setup, and the user confirms them); a blank `llm_model` is the CLI's default.
+  When the run starts, `check_env` sends the CLI one short prompt with that model on the server
+  user's account; if the account cannot use it (an unknown name, a model the plan does not include,
+  no quota), the run stops there with the CLI's reason, before any stage.
+  The model that answered is recorded as `model_used` in `00_check/env.json`, and the model the
+  annotation session ran on in `05_annotation/summary.json` (`model_used`, plus `models_called` when
+  a subagent used another model). Claude Code reports the model in its JSON
+  output; Codex does not, so for Codex the model is read from Codex's own session files of that run
+  (`$CODEX_HOME/sessions`, the session and its subagents), and only when they cannot be read is it
+  `llm_model` or the `model` of the mounted `config.toml`; `reported_by_cli: false` and
+  `model_source` say so.
 - It sends the anchors' expression profiles (gene symbols and values) and the tissue description to
   the AI provider, and CeLLMan's helper reads the Cell-Ontology server (cellman.pnucolab.com); the
   gene panel step (count platforms) reads the same server.

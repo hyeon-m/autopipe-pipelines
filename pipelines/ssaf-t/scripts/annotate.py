@@ -431,6 +431,7 @@ def main():
     secs = round((datetime.now() - t0).total_seconds())
     info = {"stage": "annotate", "host": host, "cli_version": cli_version(exe), "model": model or "(CLI default)",
             "model_used": used["model_used"], "models_called": used["models_called"],
+            "reported_by_cli": used.get("reported_by_cli"), "model_source": used.get("model_source"),
             "exit_code": rc, "seconds": secs, "units": units, "outputs": outs, "labels": labels,
             "missing": missing, "prompt": str(cdir / "prompt.md"),
             "events": str(log), "last_message": (last or "")[-4000:]}

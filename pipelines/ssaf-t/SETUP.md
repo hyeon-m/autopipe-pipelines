@@ -177,7 +177,9 @@ the same input folder.
      size (the `bin size :` line). Ask
      whether to keep it (blank) or set another (a multiple of 0.5 µm, at least the GEM's own bin).
 9. **Annotation.**
-   1. `annotate_host`: claude (default) or codex.
+   1. `annotate_host`: claude or codex. **Propose the CLI you (the AI in this chat) run in**: codex when
+      you are Codex, claude when you are Claude Code, and ask the user to confirm. The `claude` in
+      `config.yaml` is only the value for a run nobody set up; do not propose it because it is there.
    2. `llm_model`: **recommend your own model**, the model you (the AI in this chat) run as, by the
       name the chosen CLI accepts (e.g. `claude-opus-5-5`), and ask the user to confirm it. Write it
       when they confirm; write the model they name instead if they want another; leave it blank (the
